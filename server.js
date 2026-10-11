@@ -79,6 +79,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const pool = require('./db');
 const { sendSms, smsIsReal } = require('./sms');
+const { getNowShowing } = require('./movies');
 const { PROVIDERS, findCheapestRoute } = require('./graph');
 process.on('unhandledRejection', (reason) => {
   console.error('Unhandled rejection (server stayed up):', reason);
@@ -1310,6 +1311,25 @@ app.post('/api/wallet/pay', requireAuth, moneyLimiter, requirePin, asyncRoute(as
 // Lets the app check a PIN in its confirm dialog (and show "Incorrect PIN")
 // before starting a payment. The payment routes still verify the PIN themselves.
 app.post('/api/pin/check', requireAuth, moneyLimiter, requirePin, (req, res) => res.json({ ok: true }));
+
+// Live "now showing" movies for the Store (see movies.js).
+const moviesLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => ipKeyGenerator(req),
+  message: { error: 'Too many requests. Please slow down.' },
+});
+
+app.get('/api/movies/now-showing', requireAuth, moviesLimiter, asyncRoute(async (req, res) => {
+  try {
+    res.json(await getNowShowing());
+  } catch (err) {
+    console.error('Movies feed failed:', err.message);
+    res.status(err.status || 502).json({ error: 'Live movies are not available right now' });
+  }
+}));
 
 app.get('/api/notifications', requireAuth, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute(
