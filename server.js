@@ -1395,6 +1395,9 @@ app.post('/api/load', requireAuth, moneyLimiter, requirePin, asyncRoute(async (r
   if (!number || !network || amt === null) {
     return res.status(400).json({ error: 'number, network, and a positive amount (integer centavos) are required' });
   }
+  if (!/^09\d{9}$/.test(String(number))) {
+    return res.status(400).json({ error: 'Enter a valid 11-digit mobile number starting with 09' });
+  }
 
   const conn = await pool.getConnection();
   try {
@@ -1432,6 +1435,9 @@ app.post('/api/bills/pay', requireAuth, moneyLimiter, requirePin, asyncRoute(asy
   const amt = parseCentavos(req.body?.amountCentavos);
   if (!biller || amt === null) {
     return res.status(400).json({ error: 'biller and a positive amount (integer centavos) are required' });
+  }
+  if (biller.length > 150) {
+    return res.status(400).json({ error: 'Biller name is too long' });
   }
 
   const conn = await pool.getConnection();
