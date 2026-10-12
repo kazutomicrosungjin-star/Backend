@@ -333,6 +333,56 @@ function toCentavos(dbValue) {
   return Number.isSafeInteger(n) ? n : 0;
 }
 
+// ---------- wallet limits and reference numbers ----------
+// Demo values, like a real wallet's account limits. Override with env variables (in pesos).
+const LIMITS = {
+  perTransactionCentavos: Number(process.env.LIMIT_PER_TRANSACTION_PESOS || 50000) * 100,
+  dailyCentavos: Number(process.env.LIMIT_DAILY_PESOS || 100000) * 100,
+  maxBalanceCentavos: Number(process.env.LIMIT_MAX_BALANCE_PESOS || 500000) * 100,
+};
+// Money going out of the wallet counts toward the daily limit (store, food and games are bill payments).
+const SPENDING_TYPES = ['Send Money', 'Load', 'Bill Payment', 'QR Payment'];
+
+function pesoText(centavos) {
+  return `\u20B1${(centavos / 100).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+async function spentInLast24h(conn, userId) {
+  const [[row]] = await conn.query(
+    `SELECT COALESCE(SUM(amount), 0) AS total FROM transactions
+      WHERE account_type = 'user' AND account_id = ? AND is_credit = 0
+        AND type IN (${SPENDING_TYPES.map(() => '?').join(',')})
+        AND created_at > (NOW() - INTERVAL 24 HOUR)`,
+    [userId, ...SPENDING_TYPES]
+  );
+  return toCentavos(row.total);
+}
+
+// Error message if this payment would break a limit, otherwise null.
+async function outgoingLimitError(conn, userId, amt) {
+  if (amt > LIMITS.perTransactionCentavos) {
+    return `The most you can send in one transaction is ${pesoText(LIMITS.perTransactionCentavos)}.`;
+  }
+  const used = await spentInLast24h(conn, userId);
+  if (used + amt > LIMITS.dailyCentavos) {
+    const left = Math.max(0, LIMITS.dailyCentavos - used);
+    return `This would pass your daily limit of ${pesoText(LIMITS.dailyCentavos)}. You can still spend ${pesoText(left)} in the next 24 hours.`;
+  }
+  return null;
+}
+
+function recipientCapError(balanceCentavos, amt) {
+  return balanceCentavos + amt > LIMITS.maxBalanceCentavos ? "That wallet can't receive this amount because it would pass the maximum balance." : null;
+}
+
+// 13 digits, shown as "4829 105 837261" on receipts.
+function newReferenceNumber() {
+  return String(crypto.randomInt(0, 10 ** 13)).padStart(13, '0');
+}
+function referenceDetails(ref) {
+  return JSON.stringify({ 'Reference No.': `${ref.slice(0, 4)} ${ref.slice(4, 7)} ${ref.slice(7)}` });
+}
+
 // Only for building human-readable error/display strings — never for
 // storage or arithmetic.
 function centavosToPesosLabel(centavos) {
@@ -1274,16 +1324,23 @@ app.post('/api/wallet/pay', requireAuth, moneyLimiter, requirePin, asyncRoute(as
       return res.status(400).json({ error: 'Insufficient balance' });
     }
 
+    const limitError = (await outgoingLimitError(conn, sender.id, amt)) || recipientCapError(toCentavos(recipient.balance), amt);
+    if (limitError) {
+      await conn.rollback();
+      return res.status(400).json({ error: limitError });
+    }
+
     const transferRef = crypto.randomUUID();
+    const ref = newReferenceNumber();
     await conn.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [amt, sender.id]);
     await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, recipient.id]);
     await conn.execute(
-      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref) VALUES (?,?,?,?,?,?,?)',
-      ['user', sender.id, `QR Payment to ${recipient.username}`, 'QR Payment', amt, 0, transferRef]
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref, details) VALUES (?,?,?,?,?,?,?,?)',
+      ['user', sender.id, `QR Payment to ${recipient.username}`, 'QR Payment', amt, 0, transferRef, referenceDetails(ref)]
     );
     await conn.execute(
-      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref) VALUES (?,?,?,?,?,?,?)',
-      ['user', recipient.id, `QR Payment from user #${sender.id}`, 'QR Payment', amt, 1, transferRef]
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref, details) VALUES (?,?,?,?,?,?,?,?)',
+      ['user', recipient.id, `QR Payment from user #${sender.id}`, 'QR Payment', amt, 1, transferRef, referenceDetails(ref)]
     );
 
     await conn.commit();
@@ -1297,7 +1354,7 @@ app.post('/api/wallet/pay', requireAuth, moneyLimiter, requirePin, asyncRoute(as
 
     getUndoStack(sender.id).push({ ref: transferRef, at: Date.now() }); // NEW — item: mandatory "Stack"
 
-    res.json({ ok: true });
+    res.json({ ok: true, referenceNumber: ref });
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -1311,6 +1368,130 @@ app.post('/api/wallet/pay', requireAuth, moneyLimiter, requirePin, asyncRoute(as
 // Lets the app check a PIN in its confirm dialog (and show "Incorrect PIN")
 // before starting a payment. The payment routes still verify the PIN themselves.
 app.post('/api/pin/check', requireAuth, moneyLimiter, requirePin, (req, res) => res.json({ ok: true }));
+
+// ---------- account limits (shown in the app) ----------
+app.get('/api/limits', requireAuth, asyncRoute(async (req, res) => {
+  const used = await spentInLast24h(pool, req.userId);
+  res.json({
+    perTransactionCentavos: LIMITS.perTransactionCentavos,
+    dailyCentavos: LIMITS.dailyCentavos,
+    maxBalanceCentavos: LIMITS.maxBalanceCentavos,
+    usedCentavos: used,
+    remainingCentavos: Math.max(0, LIMITS.dailyCentavos - used),
+  });
+}));
+
+// ---------- cash in (simulated) ----------
+// Works like a real wallet: you ask to cash in, get a reference number and
+// instructions, and the wallet is credited once the payment arrives. Nothing here
+// touches real money, so the "payment arrives" step is a demo button that only
+// works while DEMO_MODE is on (default). Turn DEMO_MODE=false for admin-only confirmation.
+const DEMO_MODE = process.env.DEMO_MODE !== 'false';
+const CASH_IN_CHANNELS = { bank: 'Online Banking', otc: 'Convenience Store', qrph: 'QR Ph' };
+const CASH_IN_MIN = 10000; // PHP 100
+const CASH_IN_TTL_HOURS = 24;
+
+pool.execute(
+  `CREATE TABLE IF NOT EXISTS cash_ins (
+     id INT AUTO_INCREMENT PRIMARY KEY,
+     user_id INT NOT NULL,
+     channel VARCHAR(20) NOT NULL,
+     amount BIGINT NOT NULL,
+     reference VARCHAR(20) NOT NULL,
+     status ENUM('pending','completed','expired') NOT NULL DEFAULT 'pending',
+     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     expires_at DATETIME NOT NULL,
+     completed_at TIMESTAMP NULL,
+     KEY idx_cash_ins_user (user_id, created_at),
+     UNIQUE KEY uniq_cash_in_ref (reference)
+   ) ENGINE=InnoDB`
+).catch((err) => console.error('Could not create cash_ins table:', err.message));
+
+function cashInView(row) {
+  const expired = row.status === 'pending' && new Date(row.expires_at).getTime() < Date.now();
+  return {
+    id: row.id,
+    channel: row.channel,
+    channelName: CASH_IN_CHANNELS[row.channel] || row.channel,
+    amountCentavos: toCentavos(row.amount),
+    referenceNumber: row.reference,
+    status: expired ? 'expired' : row.status,
+    expiresAt: row.expires_at,
+    demoMode: DEMO_MODE,
+  };
+}
+
+app.post('/api/cashin', requireAuth, moneyLimiter, asyncRoute(async (req, res) => {
+  const channel = String(req.body?.channel || '');
+  const amt = parseCentavos(req.body?.amountCentavos);
+  if (!CASH_IN_CHANNELS[channel]) return res.status(400).json({ error: 'Choose how you want to cash in' });
+  if (amt === null || amt < CASH_IN_MIN) return res.status(400).json({ error: `The minimum cash in is ${pesoText(CASH_IN_MIN)}` });
+  if (amt > LIMITS.perTransactionCentavos) {
+    return res.status(400).json({ error: `The most you can cash in at once is ${pesoText(LIMITS.perTransactionCentavos)}` });
+  }
+  const [[open]] = await pool.query(
+    "SELECT COUNT(*) AS n FROM cash_ins WHERE user_id = ? AND status = 'pending' AND expires_at > NOW()",
+    [req.userId]
+  );
+  if (open.n >= 3) return res.status(400).json({ error: 'You already have 3 unpaid cash-in requests. Pay or wait for one to expire.' });
+
+  const reference = newReferenceNumber();
+  const [result] = await pool.execute(
+    `INSERT INTO cash_ins (user_id, channel, amount, reference, expires_at)
+     VALUES (?, ?, ?, ?, NOW() + INTERVAL ${CASH_IN_TTL_HOURS} HOUR)`,
+    [req.userId, channel, amt, reference]
+  );
+  const [[row]] = await pool.query('SELECT * FROM cash_ins WHERE id = ?', [result.insertId]);
+  res.json({ ok: true, cashIn: cashInView(row) });
+}));
+
+app.get('/api/cashin/:id', requireAuth, asyncRoute(async (req, res) => {
+  const [[row]] = await pool.query('SELECT * FROM cash_ins WHERE id = ? AND user_id = ?', [Number(req.params.id), req.userId]);
+  if (!row) return res.status(404).json({ error: 'Cash-in request not found' });
+  res.json({ ok: true, cashIn: cashInView(row) });
+}));
+
+// Demo only: pretend the payment arrived at the bank / store.
+app.post('/api/cashin/:id/simulate-paid', requireAuth, moneyLimiter, asyncRoute(async (req, res) => {
+  if (!DEMO_MODE) return res.status(403).json({ error: 'Cash in is confirmed automatically once your payment arrives.' });
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[row]] = await conn.query('SELECT * FROM cash_ins WHERE id = ? AND user_id = ? FOR UPDATE', [Number(req.params.id), req.userId]);
+    if (!row) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Cash-in request not found' });
+    }
+    if (row.status === 'completed') {
+      await conn.rollback();
+      return res.status(400).json({ error: 'This cash in was already completed' });
+    }
+    if (cashInView(row).status === 'expired') {
+      await conn.rollback();
+      return res.status(400).json({ error: 'This cash-in request has expired. Please start a new one.' });
+    }
+    const [[user]] = await conn.query('SELECT id, balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    const amt = toCentavos(row.amount);
+    if (toCentavos(user.balance) + amt > LIMITS.maxBalanceCentavos) {
+      await conn.rollback();
+      return res.status(400).json({ error: `Your wallet can hold at most ${pesoText(LIMITS.maxBalanceCentavos)}.` });
+    }
+    await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, req.userId]);
+    await conn.execute(
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, details) VALUES (?,?,?,?,?,?,?)',
+      ['user', req.userId, `Cash In via ${CASH_IN_CHANNELS[row.channel] || row.channel}`, 'Cash In', amt, 1, referenceDetails(row.reference)]
+    );
+    await conn.execute("UPDATE cash_ins SET status = 'completed', completed_at = NOW() WHERE id = ?", [row.id]);
+    await conn.commit();
+    await refreshUserInIndex(req.userId);
+    res.json({ ok: true, referenceNumber: row.reference });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}));
 
 // Live "now showing" movies for the Store (see movies.js).
 const moviesLimiter = rateLimit({
@@ -1378,16 +1559,23 @@ app.post('/api/send', requireAuth, moneyLimiter, requirePin, asyncRoute(async (r
     }
     // ---- end unchanged ----
 
+    const limitError = (await outgoingLimitError(conn, sender.id, amt)) || recipientCapError(toCentavos(recipientUser.balance), amt);
+    if (limitError) {
+      await conn.rollback();
+      return res.status(400).json({ error: limitError });
+    }
+
     const transferRef = crypto.randomUUID();
+    const ref = newReferenceNumber();
     await conn.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [amt, sender.id]);
     await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, recipientUser.id]);
     await conn.execute(
-      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref) VALUES (?,?,?,?,?,?,?)',
-      ['user', sender.id, `Sent to ${recipientUser.username}`, 'Send Money', amt, 0, transferRef]
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref, details) VALUES (?,?,?,?,?,?,?,?)',
+      ['user', sender.id, `Sent to ${recipientUser.username}`, 'Send Money', amt, 0, transferRef, referenceDetails(ref)]
     );
     await conn.execute(
-      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref) VALUES (?,?,?,?,?,?,?)',
-      ['user', recipientUser.id, `Received from user #${sender.id}`, 'Send Money', amt, 1, transferRef]
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref, details) VALUES (?,?,?,?,?,?,?,?)',
+      ['user', recipientUser.id, `Received from user #${sender.id}`, 'Send Money', amt, 1, transferRef, referenceDetails(ref)]
     );
 
     await conn.commit();
@@ -1400,7 +1588,7 @@ app.post('/api/send', requireAuth, moneyLimiter, requirePin, asyncRoute(async (r
 
     getUndoStack(sender.id).push({ ref: transferRef, at: Date.now() }); // NEW — item: mandatory "Stack"
 
-    res.json({ ok: true });
+    res.json({ ok: true, referenceNumber: ref });
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -1429,10 +1617,16 @@ app.post('/api/load', requireAuth, moneyLimiter, requirePin, asyncRoute(async (r
       return res.status(400).json({ error: 'Insufficient balance' });
     }
 
-     await conn.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [amt, req.userId]);
+    const limitError = await outgoingLimitError(conn, req.userId, amt);
+    if (limitError) {
+      await conn.rollback();
+      return res.status(400).json({ error: limitError });
+    }
+    const ref = newReferenceNumber();
+    await conn.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [amt, req.userId]);
     await conn.execute(
-      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
-      ['user', req.userId, `Mobile Load to ${number}`, 'Load', amt, 0]
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, details) VALUES (?,?,?,?,?,?,?)',
+      ['user', req.userId, `Mobile Load to ${number}`, 'Load', amt, 0, referenceDetails(ref)]
     );
 
     await conn.commit();
@@ -1441,7 +1635,7 @@ app.post('/api/load', requireAuth, moneyLimiter, requirePin, asyncRoute(async (r
     // balance (item #6 fix).
     await refreshUserInIndex(req.userId);
 
-    res.json({ ok: true });
+    res.json({ ok: true, referenceNumber: ref });
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -1470,10 +1664,16 @@ app.post('/api/bills/pay', requireAuth, moneyLimiter, requirePin, asyncRoute(asy
       return res.status(400).json({ error: 'Insufficient balance' });
     }
 
+    const limitError = await outgoingLimitError(conn, req.userId, amt);
+    if (limitError) {
+      await conn.rollback();
+      return res.status(400).json({ error: limitError });
+    }
+    const ref = newReferenceNumber();
     await conn.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [amt, req.userId]);
     await conn.execute(
-      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
-      ['user', req.userId, `Bill Pay to ${biller}`, 'Bill Payment', amt, 0]
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, details) VALUES (?,?,?,?,?,?,?)',
+      ['user', req.userId, `Bill Pay to ${biller}`, 'Bill Payment', amt, 0, referenceDetails(ref)]
     );
 
     await conn.commit();
@@ -1482,7 +1682,7 @@ app.post('/api/bills/pay', requireAuth, moneyLimiter, requirePin, asyncRoute(asy
     // balance (item #6 fix).
     await refreshUserInIndex(req.userId);
 
-    res.json({ ok: true });
+    res.json({ ok: true, referenceNumber: ref });
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -1504,7 +1704,7 @@ app.get('/api/transactions', requireAuth, asyncRoute(async (req, res) => {
   if (groupIds.length > 0) {
     const placeholders = groupIds.map(() => '?').join(',');
     const [result] = await pool.query(
-      `SELECT id, account_type, account_id, label, type, amount, is_credit AS isCredit, created_at AS createdAt
+      `SELECT id, account_type, account_id, label, type, amount, is_credit AS isCredit, created_at AS createdAt, details
        FROM transactions
        WHERE (account_type = 'user' AND account_id = ?)
           OR (account_type = 'group' AND account_id IN (${placeholders}))`,
@@ -1513,7 +1713,7 @@ app.get('/api/transactions', requireAuth, asyncRoute(async (req, res) => {
     rows = result;
   } else {
     const [result] = await pool.execute(
-      `SELECT id, account_type, account_id, label, type, amount, is_credit AS isCredit, created_at AS createdAt
+      `SELECT id, account_type, account_id, label, type, amount, is_credit AS isCredit, created_at AS createdAt, details
        FROM transactions WHERE account_type = 'user' AND account_id = ?`,
       [req.userId]
     );
