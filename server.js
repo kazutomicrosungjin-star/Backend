@@ -375,6 +375,70 @@ function recipientCapError(balanceCentavos, amt) {
   return balanceCentavos + amt > LIMITS.maxBalanceCentavos ? "That wallet can't receive this amount because it would pass the maximum balance." : null;
 }
 
+// ---------- double-charge protection ----------
+// The app sends an Idempotency-Key header with every payment. If the same key arrives
+// again (a retry after a dropped connection, or a double tap), the server answers with
+// the first result instead of charging twice. Requests without the header still work.
+pool.execute(
+  `CREATE TABLE IF NOT EXISTS idempotency_keys (
+     user_id INT NOT NULL,
+     idem_key VARCHAR(64) NOT NULL,
+     status ENUM('processing','done') NOT NULL DEFAULT 'processing',
+     response_status SMALLINT NULL,
+     response_body TEXT NULL,
+     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (user_id, idem_key)
+   ) ENGINE=InnoDB`
+).catch((err) => console.error('Could not create idempotency_keys table:', err.message));
+
+let idempotencyCalls = 0;
+
+async function idempotent(req, res, next) {
+  const key = req.get('Idempotency-Key');
+  if (!key) return next();
+  if (!/^[A-Za-z0-9_-]{16,64}$/.test(key)) {
+    return res.status(400).json({ error: 'Invalid Idempotency-Key' });
+  }
+  try {
+    // Housekeeping: keys stuck "processing" (the server restarted mid-request) and old results.
+    await pool.execute("DELETE FROM idempotency_keys WHERE status = 'processing' AND created_at < (NOW() - INTERVAL 2 MINUTE)");
+    if (++idempotencyCalls % 50 === 0) {
+      await pool.execute('DELETE FROM idempotency_keys WHERE created_at < (NOW() - INTERVAL 1 DAY)');
+    }
+    const [inserted] = await pool.execute('INSERT IGNORE INTO idempotency_keys (user_id, idem_key) VALUES (?, ?)', [req.userId, key]);
+    if (inserted.affectedRows === 0) {
+      const [[row]] = await pool.query(
+        'SELECT status, response_status, response_body FROM idempotency_keys WHERE user_id = ? AND idem_key = ?',
+        [req.userId, key]
+      );
+      if (row && row.status === 'done') {
+        res.set('Idempotent-Replay', 'true');
+        return res.status(row.response_status || 200).type('json').send(row.response_body);
+      }
+      return res.status(409).json({ error: 'This payment is already being processed. Please wait a moment.' });
+    }
+  } catch (err) {
+    return next(err);
+  }
+
+  // Remember the outcome: successes are replayed, failures free the key so the person can try again.
+  const sendJson = res.json.bind(res);
+  res.json = (body) => {
+    res.json = sendJson;
+    const status = res.statusCode;
+    const saved =
+      status < 400
+        ? pool.execute(
+            "UPDATE idempotency_keys SET status = 'done', response_status = ?, response_body = ? WHERE user_id = ? AND idem_key = ?",
+            [status, JSON.stringify(body), req.userId, key]
+          )
+        : pool.execute('DELETE FROM idempotency_keys WHERE user_id = ? AND idem_key = ?', [req.userId, key]);
+    saved.catch((err) => console.error('Could not update idempotency key:', err.message));
+    return sendJson(body);
+  };
+  next();
+}
+
 // 13 digits, shown as "4829 105 837261" on receipts.
 function newReferenceNumber() {
   return String(crypto.randomInt(0, 10 ** 13)).padStart(13, '0');
@@ -1290,7 +1354,7 @@ app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
 
 // ---------- wallet-to-wallet (QR) payment ----------
 
-app.post('/api/wallet/pay', requireAuth, moneyLimiter, requirePin, asyncRoute(async (req, res) => {
+app.post('/api/wallet/pay', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const { walletId, amountCentavos } = req.body || {};
   const amt = parseCentavos(amountCentavos);
   if (!walletId || amt === null) {
@@ -1368,6 +1432,146 @@ app.post('/api/wallet/pay', requireAuth, moneyLimiter, requirePin, asyncRoute(as
 // Lets the app check a PIN in its confirm dialog (and show "Incorrect PIN")
 // before starting a payment. The payment routes still verify the PIN themselves.
 app.post('/api/pin/check', requireAuth, moneyLimiter, requirePin, (req, res) => res.json({ ok: true }));
+
+// ---------- request money ----------
+pool.execute(
+  `CREATE TABLE IF NOT EXISTS payment_requests (
+     id INT AUTO_INCREMENT PRIMARY KEY,
+     requester_id INT NOT NULL,
+     payer_id INT NOT NULL,
+     amount BIGINT NOT NULL,
+     note VARCHAR(100) NULL,
+     status ENUM('pending','paid','declined','cancelled') NOT NULL DEFAULT 'pending',
+     reference VARCHAR(20) NULL,
+     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     responded_at TIMESTAMP NULL,
+     KEY idx_pr_payer (payer_id, status),
+     KEY idx_pr_requester (requester_id, created_at)
+   ) ENGINE=InnoDB`
+).catch((err) => console.error('Could not create payment_requests table:', err.message));
+
+function requestView(row, mine) {
+  return {
+    id: row.id,
+    amountCentavos: toCentavos(row.amount),
+    note: row.note || '',
+    status: row.status,
+    createdAt: row.created_at,
+    incoming: !mine,
+    otherName: row.other_name,
+    otherWalletId: row.other_wallet_id,
+  };
+}
+
+app.post('/api/requests', requireAuth, moneyLimiter, asyncRoute(async (req, res) => {
+  const walletId = String(req.body?.walletId || '').trim();
+  const amt = parseCentavos(req.body?.amountCentavos);
+  const note = String(req.body?.note || '').trim().slice(0, 100);
+  if (!walletId || amt === null) {
+    return res.status(400).json({ error: 'Enter who to ask and an amount' });
+  }
+  if (amt > LIMITS.perTransactionCentavos) {
+    return res.status(400).json({ error: `You can request at most ${pesoText(LIMITS.perTransactionCentavos)} at a time` });
+  }
+  const [[payer]] = await pool.query("SELECT id, username, status FROM users WHERE wallet_id = ? OR phone_number = ?", [walletId, walletId]);
+  if (!payer || payer.status !== 'active') return res.status(404).json({ error: 'No account found for that number' });
+  if (payer.id === req.userId) return res.status(400).json({ error: "You can't request money from yourself" });
+  const [[open]] = await pool.query(
+    "SELECT COUNT(*) AS n FROM payment_requests WHERE requester_id = ? AND status = 'pending'",
+    [req.userId]
+  );
+  if (open.n >= 10) return res.status(400).json({ error: 'You have 10 unpaid requests. Wait for replies or cancel some first.' });
+
+  const [result] = await pool.execute(
+    'INSERT INTO payment_requests (requester_id, payer_id, amount, note) VALUES (?,?,?,?)',
+    [req.userId, payer.id, amt, note || null]
+  );
+  res.json({ ok: true, id: result.insertId, payerName: payer.username });
+}));
+
+app.get('/api/requests', requireAuth, asyncRoute(async (req, res) => {
+  const [incoming] = await pool.query(
+    `SELECT r.id, r.amount, r.note, r.status, r.created_at, u.username AS other_name, u.wallet_id AS other_wallet_id
+       FROM payment_requests r JOIN users u ON u.id = r.requester_id
+      WHERE r.payer_id = ? ORDER BY (r.status = 'pending') DESC, r.created_at DESC LIMIT 30`,
+    [req.userId]
+  );
+  const [outgoing] = await pool.query(
+    `SELECT r.id, r.amount, r.note, r.status, r.created_at, u.username AS other_name, u.wallet_id AS other_wallet_id
+       FROM payment_requests r JOIN users u ON u.id = r.payer_id
+      WHERE r.requester_id = ? ORDER BY (r.status = 'pending') DESC, r.created_at DESC LIMIT 30`,
+    [req.userId]
+  );
+  res.json({
+    incoming: incoming.map((r) => requestView(r, false)),
+    outgoing: outgoing.map((r) => requestView(r, true)),
+  });
+}));
+
+app.post('/api/requests/:id/pay', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[request]] = await conn.query('SELECT * FROM payment_requests WHERE id = ? AND payer_id = ? FOR UPDATE', [Number(req.params.id), req.userId]);
+    if (!request) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Payment request not found' });
+    }
+    if (request.status !== 'pending') {
+      await conn.rollback();
+      return res.status(400).json({ error: `This request was already ${request.status}` });
+    }
+    const amt = toCentavos(request.amount);
+    const lockIds = [request.payer_id, request.requester_id].sort((a, b) => a - b);
+    await conn.query(`SELECT id FROM users WHERE id IN (?, ?) ORDER BY id FOR UPDATE`, lockIds);
+    const [[payer]] = await conn.query('SELECT id, username, balance FROM users WHERE id = ?', [request.payer_id]);
+    const [[requester]] = await conn.query('SELECT id, username, balance FROM users WHERE id = ?', [request.requester_id]);
+
+    if (toCentavos(payer.balance) < amt) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+    const limitError = (await outgoingLimitError(conn, payer.id, amt)) || recipientCapError(toCentavos(requester.balance), amt);
+    if (limitError) {
+      await conn.rollback();
+      return res.status(400).json({ error: limitError });
+    }
+
+    const transferRef = crypto.randomUUID();
+    const ref = newReferenceNumber();
+    await conn.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [amt, payer.id]);
+    await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, requester.id]);
+    await conn.execute(
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref, details) VALUES (?,?,?,?,?,?,?,?)',
+      ['user', payer.id, `Paid request from ${requester.username}`, 'Send Money', amt, 0, transferRef, referenceDetails(ref)]
+    );
+    await conn.execute(
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref, details) VALUES (?,?,?,?,?,?,?,?)',
+      ['user', requester.id, `Request paid by ${payer.username}`, 'Send Money', amt, 1, transferRef, referenceDetails(ref)]
+    );
+    await conn.execute("UPDATE payment_requests SET status = 'paid', reference = ?, responded_at = NOW() WHERE id = ?", [ref, request.id]);
+    await conn.commit();
+    await Promise.all([refreshUserInIndex(payer.id), refreshUserInIndex(requester.id)]);
+    res.json({ ok: true, referenceNumber: ref, recipientName: requester.username });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}));
+
+async function closeRequest(req, res, who, newStatus) {
+  const column = who === 'payer' ? 'payer_id' : 'requester_id';
+  const [result] = await pool.execute(
+    `UPDATE payment_requests SET status = ?, responded_at = NOW() WHERE id = ? AND ${column} = ? AND status = 'pending'`,
+    [newStatus, Number(req.params.id), req.userId]
+  );
+  if (result.affectedRows === 0) return res.status(404).json({ error: 'That request is no longer pending' });
+  res.json({ ok: true });
+}
+app.post('/api/requests/:id/decline', requireAuth, asyncRoute((req, res) => closeRequest(req, res, 'payer', 'declined')));
+app.post('/api/requests/:id/cancel', requireAuth, asyncRoute((req, res) => closeRequest(req, res, 'requester', 'cancelled')));
 
 // ---------- account limits (shown in the app) ----------
 app.get('/api/limits', requireAuth, asyncRoute(async (req, res) => {
@@ -1524,7 +1728,7 @@ app.get('/api/notifications', requireAuth, asyncRoute(async (req, res) => {
   res.json(rows.map((row) => ({ ...row, amount: toCentavos(row.amount) })));
 }));
 
-app.post('/api/send', requireAuth, moneyLimiter, requirePin, asyncRoute(async (req, res) => {
+app.post('/api/send', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const recipient = req.body?.recipient?.toString().trim();
   const amt = parseCentavos(req.body?.amountCentavos);
   if (!recipient || amt === null) {
@@ -1588,7 +1792,7 @@ app.post('/api/send', requireAuth, moneyLimiter, requirePin, asyncRoute(async (r
 
     getUndoStack(sender.id).push({ ref: transferRef, at: Date.now() }); // NEW — item: mandatory "Stack"
 
-    res.json({ ok: true, referenceNumber: ref });
+    res.json({ ok: true, referenceNumber: ref, recipientName: recipientUser.username });
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -1597,7 +1801,7 @@ app.post('/api/send', requireAuth, moneyLimiter, requirePin, asyncRoute(async (r
   }
 }));
 
-app.post('/api/load', requireAuth, moneyLimiter, requirePin, asyncRoute(async (req, res) => {
+app.post('/api/load', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const { number, network } = req.body || {};
   const amt = parseCentavos(req.body?.amountCentavos);
   if (!number || !network || amt === null) {
@@ -1644,13 +1848,13 @@ app.post('/api/load', requireAuth, moneyLimiter, requirePin, asyncRoute(async (r
   }
 }));
 
-app.post('/api/bills/pay', requireAuth, moneyLimiter, requirePin, asyncRoute(async (req, res) => {
+app.post('/api/bills/pay', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const biller = req.body?.biller?.toString().trim();
   const amt = parseCentavos(req.body?.amountCentavos);
   if (!biller || amt === null) {
     return res.status(400).json({ error: 'biller and a positive amount (integer centavos) are required' });
   }
-  if (biller.length > 150) {
+  if (biller.length > 185) {
     return res.status(400).json({ error: 'Biller name is too long' });
   }
 
