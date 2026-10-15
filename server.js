@@ -1602,7 +1602,7 @@ pool.execute(
      channel VARCHAR(20) NOT NULL,
      amount BIGINT NOT NULL,
      reference VARCHAR(20) NOT NULL,
-     status ENUM('pending','completed','expired') NOT NULL DEFAULT 'pending',
+     status ENUM('pending','completed','expired','rejected') NOT NULL DEFAULT 'pending',
      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
      expires_at DATETIME NOT NULL,
      completed_at TIMESTAMP NULL,
@@ -3358,6 +3358,111 @@ app.post('/api/admin/verifications/:id/respond', requireAdmin, asyncRoute(async 
   await refreshUserInIndex(userId);
   await logAdmin(req, approve ? 'approve_verification' : 'reject_verification', 'user', userId);
   res.json({ ok: true, status: approve ? 'approved' : 'rejected' });
+}));
+
+// ---------- admin: cash-in review ----------
+//
+// DEMO_MODE=false disables POST /api/cashin/:id/simulate-paid, which is then
+// the only thing that could move a cash_ins row off 'pending'. Without this
+// route a cash-in would sit pending until its 24h expiry, so an admin confirms
+// real payments here instead.
+//
+// The amount and the account it credits are read from the locked cash_ins row,
+// never from the request body, so a caller cannot choose what gets credited.
+// Only a 'pending' row can change state, and the row is locked FOR UPDATE for
+// the whole transaction, so two admins racing on the same request cannot both
+// succeed and the balance can never be credited twice.
+//
+// idempotent is deliberately NOT used here: it keys on req.userId, which
+// requireAdmin never sets (it sets req.adminId). The FOR UPDATE lock plus the
+// pending check is the real double-credit guard for an admin route.
+
+app.get('/api/admin/cashins', requireAdmin, asyncRoute(async (req, res) => {
+  const status = String(req.query.status || 'pending');
+  const allowed = ['pending', 'completed', 'expired', 'rejected'];
+  if (!allowed.includes(status)) {
+    return res.status(400).json({ error: 'status must be one of: ' + allowed.join(', ') });
+  }
+
+  const [rows] = await pool.query(
+    `SELECT c.id, c.user_id AS userId, u.username, c.channel, c.amount, c.reference,
+            c.status, c.created_at AS createdAt, c.expires_at AS expiresAt, c.completed_at AS completedAt
+       FROM cash_ins c JOIN users u ON u.id = c.user_id
+      WHERE c.status = ?
+      ORDER BY c.created_at ASC
+      LIMIT 200`,
+    [status]
+  );
+
+  res.json(
+    rows.map((r) => ({
+      ...r,
+      amount: toCentavos(r.amount),
+      channelName: CASH_IN_CHANNELS[r.channel] || r.channel,
+    }))
+  );
+}));
+
+app.post('/api/admin/cashins/:id/respond', requireAdmin, asyncRoute(async (req, res) => {
+  const cashInId = Number(req.params.id);
+  const approve = !!req.body?.approve;
+  if (!Number.isInteger(cashInId)) return res.status(400).json({ error: 'Invalid cash-in ID' });
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [[row]] = await conn.query("SELECT * FROM cash_ins WHERE id = ? AND status = 'pending' FOR UPDATE", [
+      cashInId,
+    ]);
+    if (!row) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Cash-in request not found or already decided' });
+    }
+    if (cashInView(row).status === 'expired') {
+      await conn.rollback();
+      return res.status(400).json({ error: 'This cash-in request has expired and can no longer be approved' });
+    }
+
+    if (!approve) {
+      await conn.execute("UPDATE cash_ins SET status = 'rejected' WHERE id = ?", [cashInId]);
+      await conn.commit();
+      await logAdmin(req, 'reject_cash_in', 'cash_in', cashInId, { amount: toCentavos(row.amount) });
+      return res.json({ ok: true, status: 'rejected' });
+    }
+
+    const [[user]] = await conn.query('SELECT id, balance FROM users WHERE id = ? FOR UPDATE', [row.user_id]);
+    if (!user) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'The account for this cash-in no longer exists' });
+    }
+    const amt = toCentavos(row.amount);
+    if (toCentavos(user.balance) + amt > LIMITS.maxBalanceCentavos) {
+      await conn.rollback();
+      return res.status(400).json({ error: `Your wallet can hold at most ${pesoText(LIMITS.maxBalanceCentavos)}.` });
+    }
+
+    await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, row.user_id]);
+    await conn.execute(
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, details) VALUES (?,?,?,?,?,?,?)',
+      ['user', row.user_id, `Cash In via ${CASH_IN_CHANNELS[row.channel] || row.channel}`, 'Cash In', amt, 1, referenceDetails(row.reference)]
+    );
+    await conn.execute("UPDATE cash_ins SET status = 'completed', completed_at = NOW() WHERE id = ?", [cashInId]);
+    await conn.commit();
+
+    await refreshUserInIndex(row.user_id);
+    await logAdmin(req, 'approve_cash_in', 'cash_in', cashInId, {
+      amount: amt,
+      userId: row.user_id,
+      reference: row.reference,
+    });
+    res.json({ ok: true, status: 'completed', creditedCentavos: amt, userId: row.user_id });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 }));
 
 // This must be registered AFTER every route above it — Express matches

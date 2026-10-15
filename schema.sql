@@ -226,5 +226,22 @@ CREATE TABLE IF NOT EXISTS phone_otps (
   KEY idx_phone_otps (phone_number, created_at)
 ) ENGINE=InnoDB;
 
+-- ---------- cash-in requests (simulated) ----------
+-- Also created at boot by server.js. 'rejected' is set by
+-- POST /api/admin/cashins/:id/respond when an admin declines a request.
+CREATE TABLE IF NOT EXISTS cash_ins (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  channel VARCHAR(20) NOT NULL,
+  amount BIGINT NOT NULL,
+  reference VARCHAR(20) NOT NULL,
+  status ENUM('pending','completed','expired','rejected') NOT NULL DEFAULT 'pending',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  expires_at DATETIME NOT NULL,
+  completed_at DATETIME NULL,
+  KEY idx_cash_ins_user (user_id, created_at),
+  UNIQUE KEY uniq_cash_in_ref (reference)
+) ENGINE=InnoDB;
+
 -- No admin is created here on purpose. After loading this schema run:
 --   node create-admin.js <username> <password> <4-digit-pin>
