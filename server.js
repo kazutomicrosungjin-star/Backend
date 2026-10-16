@@ -2204,7 +2204,7 @@ app.post('/api/groups/:groupId/join-requests/:reqId/respond', requireAuth, async
   }
 }));
 
-app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.groupId);
   const reqId = Number(req.params.reqId);
   const approve = !!req.body?.approve;
@@ -2292,7 +2292,7 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, a
   }
 }));
 
-app.post('/api/groups/:id/contribute', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/groups/:id/contribute', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   const amt = parseCentavos(req.body?.amountCentavos);
   if (amt === null) return res.status(400).json({ error: 'A positive amount (integer centavos) is required' });
@@ -2384,7 +2384,7 @@ app.get('/api/savings/mine', requireAuth, asyncRoute(async (req, res) => {
   })));
 }));
 
-app.post('/api/savings/:id/deposit', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/savings/:id/deposit', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const goalId = Number(req.params.id);
   const amt = parseCentavos(req.body?.amountCentavos);
   if (amt === null) return res.status(400).json({ error: 'A positive amount (integer centavos) is required' });
@@ -2429,7 +2429,7 @@ app.post('/api/savings/:id/deposit', requireAuth, asyncRoute(async (req, res) =>
   }
 }));
 
-app.post('/api/savings/:id/withdraw', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/savings/:id/withdraw', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const goalId = Number(req.params.id);
   const amt = parseCentavos(req.body?.amountCentavos);
   if (amt === null) return res.status(400).json({ error: 'A positive amount (integer centavos) is required' });
@@ -2472,7 +2472,7 @@ app.post('/api/savings/:id/withdraw', requireAuth, asyncRoute(async (req, res) =
   }
 }));
 
-app.delete('/api/savings/:id', requireAuth, asyncRoute(async (req, res) => {
+app.delete('/api/savings/:id', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const goalId = Number(req.params.id);
   const conn = await pool.getConnection();
   try {
@@ -2890,7 +2890,7 @@ app.post('/api/admin/transfers/:transferRef/reverse', requireAdmin, asyncRoute(a
 }));
 const UNDO_WINDOW_MS = 60 * 1000;
 
-app.post('/api/undo', requireAuth, moneyLimiter, asyncRoute(async (req, res) => {
+app.post('/api/undo', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const stack = getUndoStack(req.userId);
   if (stack.isEmpty()) {
     return res.status(400).json({ error: 'Nothing to undo' });
@@ -3038,7 +3038,7 @@ app.get('/api/loans/mine', requireAuth, asyncRoute(async (req, res) => {
   res.json(rows.map((l) => ({ ...l, amount: toCentavos(l.amount), amountRepaid: toCentavos(l.amountRepaid) })));
 }));
 
-app.post('/api/loans/:id/repay', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/loans/:id/repay', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const loanId = Number(req.params.id);
   const amt = parseCentavos(req.body?.amountCentavos);
   if (amt === null) return res.status(400).json({ error: 'A positive repayment amount (integer centavos) is required' });
