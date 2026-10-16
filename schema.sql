@@ -115,6 +115,8 @@ CREATE TABLE IF NOT EXISTS withdrawal_requests (
   decided_by_admin_id INT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   decided_at TIMESTAMP NULL,
+  KEY group_id (group_id),
+  KEY decided_by_admin_id (decided_by_admin_id),
   FOREIGN KEY (group_id) REFERENCES `groups`(id) ON DELETE CASCADE,
   FOREIGN KEY (decided_by_admin_id) REFERENCES admins(id) ON DELETE SET NULL
 ) ENGINE=InnoDB;
@@ -131,8 +133,10 @@ CREATE TABLE IF NOT EXISTS transactions (
   transfer_ref VARCHAR(64) NULL,
   details JSON NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  reversed_transfer_ref VARCHAR(64) NULL,
   KEY idx_tx_account (account_type, account_id, created_at),
-  KEY idx_tx_ref (transfer_ref)
+  KEY idx_tx_ref (transfer_ref),
+  KEY idx_tx_reversed (reversed_transfer_ref)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS savings_goals (
