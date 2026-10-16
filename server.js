@@ -2265,6 +2265,13 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, m
         return res.status(400).json({ error: 'Group balance too low to complete this withdrawal now' });
       }
 
+      const [[requester]] = await conn.query('SELECT balance FROM users WHERE id = ? FOR UPDATE', [request.requester_id]);
+      const capError = recipientCapError(toCentavos(requester.balance), amt);
+      if (capError) {
+        await conn.rollback();
+        return res.status(400).json({ error: capError });
+      }
+
       await conn.execute('UPDATE `groups` SET balance = balance - ? WHERE id = ?', [amt, groupId]);
       await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, request.requester_id]);
       await conn.execute(
@@ -2313,6 +2320,12 @@ app.post('/api/groups/:id/contribute', requireAuth, moneyLimiter, idempotent, re
       await conn.rollback();
       return res.status(400).json({ error: 'Insufficient balance' });
     }
+    const limitError = await outgoingLimitError(conn, req.userId, amt);
+    if (limitError) {
+      await conn.rollback();
+      return res.status(400).json({ error: limitError });
+    }
+
     await conn.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [amt, req.userId]);
     await conn.execute('UPDATE `groups` SET balance = balance + ? WHERE id = ?', [amt, groupId]);
     await conn.execute(
@@ -2406,6 +2419,12 @@ app.post('/api/savings/:id/deposit', requireAuth, moneyLimiter, idempotent, requ
       return res.status(400).json({ error: 'Insufficient balance' });
     }
 
+    const limitError = await outgoingLimitError(conn, req.userId, amt);
+    if (limitError) {
+      await conn.rollback();
+      return res.status(400).json({ error: limitError });
+    }
+
     const newSaved = toCentavos(goal.saved_amount) + amt;
     const nowComplete = newSaved >= toCentavos(goal.target_amount);
 
@@ -2451,6 +2470,13 @@ app.post('/api/savings/:id/withdraw', requireAuth, moneyLimiter, idempotent, req
       return res.status(400).json({ error: 'Not enough saved in this goal' });
     }
 
+    const [[user]] = await conn.query('SELECT balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    const capError = recipientCapError(toCentavos(user.balance), amt);
+    if (capError) {
+      await conn.rollback();
+      return res.status(400).json({ error: capError });
+    }
+
     const newSaved = saved - amt;
     await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, req.userId]);
     await conn.execute('UPDATE savings_goals SET saved_amount = ?, status = ? WHERE id = ?', [
@@ -2487,6 +2513,12 @@ app.delete('/api/savings/:id', requireAuth, moneyLimiter, idempotent, requirePin
     }
     const saved = toCentavos(goal.saved_amount);
     if (saved > 0) {
+      const [[user]] = await conn.query('SELECT balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+      const capError = recipientCapError(toCentavos(user.balance), saved);
+      if (capError) {
+        await conn.rollback();
+        return res.status(400).json({ error: capError });
+      }
       await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [saved, req.userId]);
       await conn.execute(
         'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
@@ -3070,6 +3102,11 @@ app.post('/api/loans/:id/repay', requireAuth, moneyLimiter, idempotent, requireP
     const loanRepaid = toCentavos(loan.amount_repaid);
     const remaining = loanAmount - loanRepaid;
     const applied = Math.min(amt, remaining);
+    const limitError = await outgoingLimitError(conn, req.userId, applied);
+    if (limitError) {
+      await conn.rollback();
+      return res.status(400).json({ error: limitError });
+    }
     const newRepaid = loanRepaid + applied;
     const nowRepaid = newRepaid >= loanAmount;
 
