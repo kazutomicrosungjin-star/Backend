@@ -341,7 +341,7 @@ const LIMITS = {
   maxBalanceCentavos: Number(process.env.LIMIT_MAX_BALANCE_PESOS || 500000) * 100,
 };
 // Money going out of the wallet counts toward the daily limit (store, food and games are bill payments).
-const SPENDING_TYPES = ['Send Money', 'Load', 'Bill Payment', 'QR Payment'];
+const SPENDING_TYPES = ['Send Money', 'Load', 'Bill Payment', 'QR Payment', 'Loan Repayment'];
 
 function pesoText(centavos) {
   return `\u20B1${(centavos / 100).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
