@@ -2270,7 +2270,8 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, m
       const capError = recipientCapError(toCentavos(requester.balance), amt);
       if (capError) {
         await conn.rollback();
-        return res.status(400).json({ error: capError });
+        // Say whose wallet is full without naming them or exposing their balance.
+        return res.status(400).json({ error: 'The member who requested this withdrawal cannot receive it right now because their wallet is close to its limit. Your vote was not recorded.' });
       }
 
       await conn.execute('UPDATE `groups` SET balance = balance - ? WHERE id = ?', [amt, groupId]);
@@ -2475,7 +2476,7 @@ app.post('/api/savings/:id/withdraw', requireAuth, moneyLimiter, idempotent, req
     const capError = recipientCapError(toCentavos(user.balance), amt);
     if (capError) {
       await conn.rollback();
-      return res.status(400).json({ error: capError });
+      return res.status(400).json({ error: `Your wallet can hold at most ${pesoText(LIMITS.maxBalanceCentavos)}. Spend or send some money first, then try again. Your savings are still safe in this goal.` });
     }
 
     const newSaved = saved - amt;
@@ -2518,7 +2519,7 @@ app.delete('/api/savings/:id', requireAuth, moneyLimiter, idempotent, requirePin
       const capError = recipientCapError(toCentavos(user.balance), saved);
       if (capError) {
         await conn.rollback();
-        return res.status(400).json({ error: capError });
+        return res.status(400).json({ error: `Your wallet can hold at most ${pesoText(LIMITS.maxBalanceCentavos)}. Spend or send some money first, then try again. Your savings are still safe and this goal was not closed.` });
       }
       await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [saved, req.userId]);
       await conn.execute(
