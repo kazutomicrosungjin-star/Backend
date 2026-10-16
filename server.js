@@ -2054,8 +2054,10 @@ app.post('/api/groups/:id/withdraw-requests', requireAuth, asyncRoute(async (req
       return res.status(400).json({ error: 'Insufficient group balance' });
     }
 
-    // majority = more than half of current members
-    const approvalsNeeded = Math.floor(members.length / 2) + 1;
+    // Majority of the members OTHER than the requester, matching the threshold
+    // the respond route enforces. The requester cannot vote on their own
+    // request, so counting them here made this bar overstate progress.
+    const approvalsNeeded = Math.floor(Math.max(0, members.length - 1) / 2) + 1;
 
     const [result] = await conn.execute(
       'INSERT INTO group_withdraw_requests (group_id, requester_id, amount, reason, approvals_needed) VALUES (?,?,?,?,?)',
@@ -2237,6 +2239,27 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, m
       return res.status(404).json({ error: 'Request not found or already decided' });
     }
 
+    // The person who asked for the money never counts towards approving it, so
+    // only the OTHER members vote. needed is a strict majority of those, and a
+    // group with nobody else in it can never pay a withdrawal out. This is
+    // computed here rather than read from request.approvals_needed, which was
+    // frozen at creation time from the TOTAL member count and so still counts
+    // the requester as one of the voters.
+    const [[{ eligible }]] = await conn.query(
+      'SELECT COUNT(*) AS eligible FROM group_members WHERE group_id = ? AND user_id <> ?',
+      [groupId, request.requester_id]
+    );
+    if (eligible < 1) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'A group needs at least two members before a withdrawal can be approved' });
+    }
+    const approvalsNeeded = Math.floor(eligible / 2) + 1;
+
+    if (req.userId === request.requester_id) {
+      await conn.rollback();
+      return res.status(403).json({ error: 'You cannot vote on your own withdrawal request' });
+    }
+
     const [[already]] = await conn.query(
       'SELECT 1 FROM group_withdraw_approvals WHERE request_id = ? AND member_id = ?',
       [reqId, req.userId]
@@ -2258,11 +2281,11 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, m
     }
 
     const [[{ approvals }]] = await conn.query(
-      "SELECT COUNT(*) AS approvals FROM group_withdraw_approvals WHERE request_id = ? AND decision = 'approve'",
-      [reqId]
+      "SELECT COUNT(*) AS approvals FROM group_withdraw_approvals WHERE request_id = ? AND decision = 'approve' AND member_id <> ?",
+      [reqId, request.requester_id]
     );
 
-    if (approvals >= request.approvals_needed) {
+    if (approvals >= approvalsNeeded) {
       const amt = toCentavos(request.amount);
 
       const [[group]] = await conn.query('SELECT balance FROM `groups` WHERE id = ? FOR UPDATE', [groupId]);
@@ -2297,7 +2320,7 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, m
     }
 
     await conn.commit();
-    res.json({ ok: true, status: 'pending', approvalsCount: approvals, approvalsNeeded: request.approvals_needed });
+    res.json({ ok: true, status: 'pending', approvalsCount: approvals, approvalsNeeded });
   } catch (err) {
     await conn.rollback();
     throw err;
