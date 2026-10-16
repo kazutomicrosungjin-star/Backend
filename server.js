@@ -1589,8 +1589,9 @@ app.get('/api/limits', requireAuth, asyncRoute(async (req, res) => {
 // Works like a real wallet: you ask to cash in, get a reference number and
 // instructions, and the wallet is credited once the payment arrives. Nothing here
 // touches real money, so the "payment arrives" step is a demo button that only
-// works while DEMO_MODE is on (default). Turn DEMO_MODE=false for admin-only confirmation.
-const DEMO_MODE = process.env.DEMO_MODE !== 'false';
+// works while DEMO_MODE is on. Demo mode is OFF unless DEMO_MODE is exactly
+// 'true', so a fresh checkout gets admin-only confirmation by default.
+const DEMO_MODE = process.env.DEMO_MODE === 'true';
 const CASH_IN_CHANNELS = { bank: 'Online Banking', otc: 'Convenience Store', qrph: 'QR Ph' };
 const CASH_IN_MIN = 10000; // PHP 100
 const CASH_IN_TTL_HOURS = 24;
@@ -3399,10 +3400,10 @@ app.post('/api/admin/verifications/:id/respond', requireAdmin, asyncRoute(async 
 
 // ---------- admin: cash-in review ----------
 //
-// DEMO_MODE=false disables POST /api/cashin/:id/simulate-paid, which is then
-// the only thing that could move a cash_ins row off 'pending'. Without this
-// route a cash-in would sit pending until its 24h expiry, so an admin confirms
-// real payments here instead.
+// While demo mode is off (the default), POST /api/cashin/:id/simulate-paid is
+// disabled and this route is the only way to move a cash_ins row off 'pending'.
+// Without it a cash-in would sit pending until its 24h expiry, so an admin
+// confirms real payments here instead.
 //
 // The amount and the account it credits are read from the locked cash_ins row,
 // never from the request body, so a caller cannot choose what gets credited.
