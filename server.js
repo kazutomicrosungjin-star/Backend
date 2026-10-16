@@ -2027,7 +2027,7 @@ app.get('/api/groups/:id/requests', requireAuth, asyncRoute(async (req, res) => 
 app.post('/api/groups/:id/withdraw-requests', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   const amt = parseCentavos(req.body?.amountCentavos);
-  const reason = cleanText(req.body?.reason, 255) || null;
+  const reason = cleanText(req.body?.reason, 255) || '';
   if (amt === null) return res.status(400).json({ error: 'A positive amount (integer centavos) is required' });
 
   const conn = await pool.getConnection();
