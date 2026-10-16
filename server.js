@@ -1349,7 +1349,12 @@ app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute('SELECT id, username, wallet_id, balance FROM users WHERE id = ?', [req.userId]);
   if (!rows[0]) return res.status(404).json({ error: 'User not found' });
   const u = rows[0];
-  res.json({ id: u.id, username: u.username, wallet_id: u.wallet_id, balance: toCentavos(u.balance) });
+  // Both spellings are returned on purpose. The app reads `walletId` (it is
+  // what /api/login and the device-login route send), and the client's
+  // refreshMe() replaces its whole user map with this response every 8 s, so a
+  // snake_case-only payload silently empties the Wallet ID and the "My QR" code.
+  // wallet_id stays for anything already reading it. Keep the two in sync.
+  res.json({ id: u.id, username: u.username, wallet_id: u.wallet_id, walletId: u.wallet_id, balance: toCentavos(u.balance) });
 }));
 
 // ---------- wallet-to-wallet (QR) payment ----------
