@@ -1658,7 +1658,7 @@ app.get('/api/cashin/:id', requireAuth, asyncRoute(async (req, res) => {
 
 // Demo only: pretend the payment arrived at the bank / store.
 app.post('/api/cashin/:id/simulate-paid', requireAuth, moneyLimiter, asyncRoute(async (req, res) => {
-  if (!DEMO_MODE) return res.status(403).json({ error: 'Cash in is confirmed automatically once your payment arrives.' });
+  if (!DEMO_MODE) return res.status(403).json({ error: 'Cash in is confirmed by an admin once your payment arrives.' });
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();

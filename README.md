@@ -11,6 +11,10 @@ Node + Express + MySQL. Start with `npm install` then `npm start`.
      `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
    - `PHOTO_ENCRYPTION_KEY`: 64 random hex characters (same generator command). Encrypts ID photos waiting for review. Set it BEFORE the first sign-up and never change it afterwards, or old photos can't be shown.
    - Optional: `CORS_ORIGIN`, `DB_SSL=true` (if the DB is on another network), `KEEP_ID_PHOTOS=true`.
+   - `DEMO_MODE` is off unless it is exactly `true`. Leave it unset or `false` on
+     any real deployment: it gates a demo button that would let a logged-in user
+     credit themselves. With it off, an admin confirms each cash in via
+     `POST /api/admin/cashins/:id/respond`.
 4. Create the first admin: `node create-admin.js <username> <password> <4-digit-pin>`
 5. Point the Flutter app's `apiBase` (and the admin panel) at `https://<your-domain>/api`.
 
