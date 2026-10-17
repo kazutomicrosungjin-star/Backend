@@ -2417,6 +2417,16 @@ app.post('/api/groups/:id/contribute', requireAuth, moneyLimiter, idempotent, re
       'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
       ['group', groupId, `Contribution from user #${req.userId}`, 'Contribution', amt, 1]
     );
+    // The user's own half of the same movement. Without this row the wallet is
+    // debited with nothing in its own history, so Money out and
+    // /transactions/summary both under-report. Mirrors the paired insert in the
+    // withdrawal route. No transfer_ref, so /api/undo cannot reach it - group
+    // flows are not undoable. The group name is not loaded here, so the label
+    // names the group by id like the sibling row does.
+    await conn.execute(
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
+      ['user', req.userId, `Contribution to group #${groupId}`, 'Contribution', amt, 0]
+    );
     await conn.commit();
 
     // Row is committed — refresh so the index doesn't serve a stale
