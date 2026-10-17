@@ -139,6 +139,48 @@ CREATE TABLE IF NOT EXISTS transactions (
   KEY idx_tx_reversed (reversed_transfer_ref)
 ) ENGINE=InnoDB;
 
+-- ---------- events and tickets ----------
+-- Added after `transactions` so the two commerce tables sit together. Both are
+-- new tables, so CREATE TABLE IF NOT EXISTS creates them on the next boot of a
+-- server started with AUTO_SETUP_DB=true; no ALTER of an existing table is
+-- needed and setup-db.js is not involved.
+--
+-- capacity is deliberately unused in v1 (NULL means unlimited). It exists so
+-- enabling a limit later is an additive change. There is no tickets_sold
+-- counter on purpose: the tickets table is the single source of truth and a
+-- counter could drift out of step with it.
+CREATE TABLE IF NOT EXISTS events (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  title VARCHAR(150) NOT NULL,
+  venue VARCHAR(150) NOT NULL,
+  starts_at TIMESTAMP NOT NULL,
+  price_centavos BIGINT NOT NULL,
+  capacity INT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_events_starts (starts_at)
+) ENGINE=InnoDB;
+
+-- ticket_code is a bearer credential, so it is 128 bits of
+-- crypto.randomBytes(16) hex, not the short human-facing reference number that
+-- appears on receipts. status is unused in v1 (there is no cancel, refund or
+-- scanner yet) but a ticket with no lifecycle state cannot be extended without
+-- a second migration.
+CREATE TABLE IF NOT EXISTS tickets (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  event_id INT NOT NULL,
+  ticket_code CHAR(32) NOT NULL,
+  quantity INT NOT NULL DEFAULT 1,
+  amount_paid_centavos BIGINT NOT NULL,
+  status ENUM('valid','cancelled','used') NOT NULL DEFAULT 'valid',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uniq_ticket_code (ticket_code),
+  KEY idx_tickets_user (user_id, created_at),
+  KEY idx_tickets_event (event_id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
 CREATE TABLE IF NOT EXISTS savings_goals (
   id INT AUTO_INCREMENT PRIMARY KEY,
   user_id INT NOT NULL,
