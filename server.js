@@ -341,7 +341,7 @@ const LIMITS = {
   maxBalanceCentavos: Number(process.env.LIMIT_MAX_BALANCE_PESOS || 500000) * 100,
 };
 // Money going out of the wallet counts toward the daily limit (store, food and games are bill payments).
-const SPENDING_TYPES = ['Send Money', 'Load', 'Bill Payment', 'QR Payment', 'Loan Repayment'];
+const SPENDING_TYPES = ['Send Money', 'Load', 'Bill Payment', 'QR Payment', 'Loan Repayment', 'Event Ticket'];
 
 function pesoText(centavos) {
   return `\u20B1${(centavos / 100).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -2624,6 +2624,153 @@ app.delete('/api/savings/:id', requireAuth, moneyLimiter, idempotent, requirePin
     await conn.commit();
     await refreshUserInIndex(req.userId);
     res.json({ ok: true, returnedCentavos: saved });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}));
+
+// ---------- events and tickets ----------
+//
+// The catalog lives in the `events` table and purchased tickets in `tickets`
+// (see schema.sql). Rows are added by hand in v1 - there is no admin route and
+// no seed data.
+//
+// Payment deliberately does NOT reuse POST /bills/pay. That route debits the
+// wallet and writes only a transactions row, so a ticket bought through it
+// would leave the user charged with nothing to retrieve. Here the balance
+// update, the transactions row and the tickets row are written inside ONE
+// transaction, so a failure anywhere rolls all three back together.
+const EVENT_LIST_LIMIT = 50;
+const TICKET_LIST_LIMIT = 50;
+const MAX_TICKETS_PER_ORDER = 10;
+
+app.get('/api/events', requireAuth, asyncRoute(async (req, res) => {
+  // Upcoming only, soonest first. starts_at is compared with MySQL's own clock,
+  // never the client's, so a wrong device clock cannot buy a past event.
+  const [rows] = await pool.query(
+    `SELECT id, title, venue, starts_at AS startsAt, price_centavos AS priceCentavos
+       FROM events
+      WHERE starts_at > NOW()
+      ORDER BY starts_at ASC
+      LIMIT ?`,
+    [EVENT_LIST_LIMIT]
+  );
+  res.json(rows.map((row) => ({ ...row, priceCentavos: toCentavos(row.priceCentavos) })));
+}));
+
+app.get('/api/tickets', requireAuth, asyncRoute(async (req, res) => {
+  // Scoped to the caller on the server. No user id is accepted from the
+  // request, so one account can never list another account's tickets.
+  const [rows] = await pool.query(
+    `SELECT t.id, t.ticket_code AS ticketCode, t.quantity,
+            t.amount_paid_centavos AS amountPaidCentavos, t.status,
+            t.created_at AS createdAt,
+            e.id AS eventId, e.title, e.venue, e.starts_at AS startsAt
+       FROM tickets t
+       JOIN events e ON e.id = t.event_id
+      WHERE t.user_id = ?
+      ORDER BY t.created_at DESC, t.id DESC
+      LIMIT ?`,
+    [req.userId, TICKET_LIST_LIMIT]
+  );
+  res.json(rows.map((row) => ({ ...row, amountPaidCentavos: toCentavos(row.amountPaidCentavos) })));
+}));
+
+app.post('/api/events/:id/tickets', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
+  const eventId = Number(req.params.id);
+  if (!Number.isInteger(eventId) || eventId < 1) {
+    return res.status(400).json({ error: 'Invalid event ID' });
+  }
+  const quantity = Number(req.body?.quantity);
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_TICKETS_PER_ORDER) {
+    return res.status(400).json({ error: `quantity must be a whole number from 1 to ${MAX_TICKETS_PER_ORDER}` });
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [[user]] = await conn.query('SELECT id, balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    if (!user) {
+      await conn.rollback();
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    // The price is read from the locked event row, never from the request, so
+    // a modified client cannot choose what it pays. FOR UPDATE also serialises
+    // concurrent buys of the same event.
+    const [[event]] = await conn.query(
+      'SELECT id, title, venue, starts_at, price_centavos, (starts_at > NOW()) AS isUpcoming FROM events WHERE id = ? FOR UPDATE',
+      [eventId]
+    );
+    if (!event) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Event not found' });
+    }
+    if (!event.isUpcoming) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'This event has already started' });
+    }
+
+    const price = toCentavos(event.price_centavos);
+    const amount = price * quantity;
+    // Guards a mistyped catalogue row before it reaches the balance update: a
+    // non-positive price, a product that leaves the safe-integer range, or a
+    // total above the same ceiling parseCentavos() enforces elsewhere.
+    if (!Number.isSafeInteger(price) || price <= 0 || !Number.isSafeInteger(amount) || amount <= 0 || amount > MAX_CENTAVOS) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'This event has no valid price set' });
+    }
+
+    if (toCentavos(user.balance) < amount) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+    const limitError = await outgoingLimitError(conn, req.userId, amount);
+    if (limitError) {
+      await conn.rollback();
+      return res.status(400).json({ error: limitError });
+    }
+
+    const ref = newReferenceNumber();
+    await conn.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [amount, req.userId]);
+    await conn.execute(
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, details) VALUES (?,?,?,?,?,?,?)',
+      ['user', req.userId, `Event Ticket - ${cleanText(event.title, 150)}`, 'Event Ticket', amount, 0, referenceDetails(ref)]
+    );
+    // 128 bits of Node crypto, not newReferenceNumber() - the ticket code is a
+    // bearer credential and must not be short or already printed on a receipt.
+    // Nothing here is logged.
+    const ticketCode = crypto.randomBytes(16).toString('hex');
+    const [ticketResult] = await conn.execute(
+      `INSERT INTO tickets (user_id, event_id, ticket_code, quantity, amount_paid_centavos)
+       VALUES (?,?,?,?,?)`,
+      [req.userId, eventId, ticketCode, quantity, amount]
+    );
+
+    await conn.commit();
+
+    // Both rows are committed - refresh so the index doesn't serve a stale
+    // balance (item #6 fix).
+    await refreshUserInIndex(req.userId);
+
+    res.json({
+      ok: true,
+      referenceNumber: ref,
+      ticket: {
+        id: ticketResult.insertId,
+        ticketCode,
+        quantity,
+        amountPaidCentavos: amount,
+        eventId,
+        title: event.title,
+        venue: event.venue,
+        startsAt: event.starts_at,
+      },
+    });
   } catch (err) {
     await conn.rollback();
     throw err;
