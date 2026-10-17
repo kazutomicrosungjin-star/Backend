@@ -3597,6 +3597,74 @@ app.post('/api/admin/cashins/:id/respond', requireAdmin, asyncRoute(async (req, 
   }
 }));
 
+// ---------- admin audit log (read only) ----------
+//
+// Reads the rows logAdmin/logAdminEvent write. Deliberately does NOT call
+// logAdmin itself: reading the log must not add a row to it, or every page
+// view would produce another entry and the log would grow without bound.
+//
+// LEFT JOIN, not JOIN: logAdminEvent writes admin_id = NULL for
+// 'admin_login_locked', so an inner join would silently drop those rows.
+app.get('/api/admin/audit-log', requireAdmin, asyncRoute(async (req, res) => {
+  // Garbage gets a clear 400; a valid number out of range is clamped instead.
+  let limit = 50;
+  if (req.query.limit !== undefined && String(req.query.limit).trim() !== '') {
+    const n = Number(String(req.query.limit).trim());
+    if (!Number.isInteger(n)) return res.status(400).json({ error: 'limit must be an integer' });
+    limit = Math.min(Math.max(n, 1), 200);
+  }
+
+  let before = null;
+  if (req.query.before !== undefined && String(req.query.before).trim() !== '') {
+    const n = Number(String(req.query.before).trim());
+    if (!Number.isInteger(n) || n < 1) {
+      return res.status(400).json({ error: 'before must be a positive integer id' });
+    }
+    before = n;
+  }
+
+  // Exact match against action VARCHAR(50). Bounded here so a huge value
+  // cannot be sent to the database just to match nothing.
+  const action = req.query.action === undefined ? '' : String(req.query.action).trim();
+  if (action.length > 50) return res.status(400).json({ error: 'action must be at most 50 characters' });
+
+  // Every fragment below is a fixed string; only values are parameterized.
+  const where = ['1=1'];
+  const params = [];
+  if (before !== null) {
+    where.push('l.id < ?');
+    params.push(before);
+  }
+  if (action) {
+    where.push('l.action = ?');
+    params.push(action);
+  }
+  // One extra row tells us whether another page exists without a COUNT(*).
+  params.push(limit + 1);
+
+  const [rows] = await pool.query(
+    `SELECT l.id, a.username AS adminUsername, l.action,
+            l.target_type AS targetType, l.target_id AS targetId,
+            l.details, l.ip, l.created_at AS createdAt
+       FROM admin_audit_log l
+       LEFT JOIN admins a ON a.id = l.admin_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY l.id DESC
+      LIMIT ?`,
+    params
+  );
+
+  const hasMore = rows.length > limit;
+  const entries = hasMore ? rows.slice(0, limit) : rows;
+  // details is passed through untouched. It is JSON written by logAdmin, and
+  // the admin panel must escape it before rendering; see esc() there.
+  res.json({
+    entries,
+    hasMore,
+    nextBefore: hasMore && entries.length ? entries[entries.length - 1].id : null,
+  });
+}));
+
 // This must be registered AFTER every route above it — Express matches
 // error-handling middleware (4-arg signature) only for errors that occur
 // during/after routes already registered before it in the file.
