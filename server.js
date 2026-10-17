@@ -1941,6 +1941,61 @@ app.get('/api/transactions', requireAuth, asyncRoute(async (req, res) => {
   res.json(sorted);
 }));
 
+// Money in / money out for one period, for the Home spending summary.
+// Direction is never re-derived from `type` here. Every insert above already
+// wrote is_credit on the row, so savings deposits and withdrawals, loan
+// disbursements and repayments, and cash-ins are classified at write time.
+// That also means a reversed transfer needs no special case: undo inserts a
+// compensating row with the opposite direction (see the reversal core), so an
+// undone send contributes one debit and one equal credit and nets to zero.
+// Group rows are excluded because the client ledger merges them into the same
+// list; without account_type = 'user' a group contribution would be counted as
+// this user's money in.
+const SUMMARY_PERIOD_START_SQL = `CASE WHEN ? = 'week'
+       THEN DATE_SUB(DATE(NOW()), INTERVAL WEEKDAY(NOW()) DAY)
+       ELSE DATE_SUB(DATE(NOW()), INTERVAL DAYOFMONTH(NOW()) - 1 DAY)
+     END`;
+
+app.get('/api/transactions/summary', requireAuth, asyncRoute(async (req, res) => {
+  // Unknown or missing values fall back to 'month' rather than 400, matching how
+  // the other routes handle a small whitelist query param (sortBy, direction).
+  const period = req.query.period === 'week' ? 'week' : 'month';
+
+  // Boundaries come from MySQL's own clock, the same one that stamps created_at
+  // and the one spentInLast24h() trusts, so a row can never land outside the
+  // window this reports. Written once and wrapped in MIN/MAX because this is an
+  // aggregate query with no GROUP BY, and selecting the bare columns instead
+  // would be rejected under MySQL's default ONLY_FULL_GROUP_BY. The join runs
+  // from that one-row subquery so a user with no matching transactions still
+  // gets a row back with real boundaries instead of zeros with null dates.
+  const [[row]] = await pool.execute(
+    `SELECT MIN(b.startAt) AS periodStart,
+            MAX(b.endAt) AS periodEnd,
+            COALESCE(SUM(CASE WHEN t.is_credit = 1 THEN t.amount ELSE 0 END), 0) AS moneyIn,
+            COALESCE(SUM(CASE WHEN t.is_credit = 0 THEN t.amount ELSE 0 END), 0) AS moneyOut,
+            COALESCE(SUM(CASE WHEN t.is_credit = 1 THEN 1 ELSE 0 END), 0) AS moneyInCount,
+            COALESCE(SUM(CASE WHEN t.is_credit = 0 THEN 1 ELSE 0 END), 0) AS moneyOutCount
+     FROM (SELECT ${SUMMARY_PERIOD_START_SQL} AS startAt, NOW() AS endAt) b
+     LEFT JOIN transactions t
+       ON t.account_type = 'user' AND t.account_id = ?
+        AND t.created_at >= b.startAt AND t.created_at <= b.endAt`,
+    [period, req.userId]
+  );
+
+  // SUM() over a BIGINT column comes back as DECIMAL, which mysql2 hands over
+  // as a string, so every figure goes through toCentavos: it parses, rejects
+  // anything outside the safe-integer range, and turns a NULL into 0.
+  res.json({
+    period,
+    periodStart: row.periodStart,
+    periodEnd: row.periodEnd,
+    moneyInCentavos: toCentavos(row.moneyIn),
+    moneyOutCentavos: toCentavos(row.moneyOut),
+    moneyInCount: toCentavos(row.moneyInCount),
+    moneyOutCount: toCentavos(row.moneyOutCount),
+  });
+}));
+
 app.get('/api/groups/mine', requireAuth, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute(
     `SELECT g.id, g.name, g.balance,
