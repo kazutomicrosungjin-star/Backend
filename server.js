@@ -2854,6 +2854,180 @@ app.post('/api/events/:id/tickets', requireAuth, moneyLimiter, idempotent, requi
   }
 }));
 
+// ---------- admin: ticket lookup and redemption ----------
+//
+// Gate staff scan the e-ticket QR and mark the ticket used so the same code
+// cannot be presented twice. This moves no money, so requirePin and the
+// `idempotent` middleware do not apply: neither is needed to stop a double
+// scan. What stops a double scan is the row lock plus a status transition that
+// is re-checked in the UPDATE's own WHERE clause, all inside one transaction -
+// the same shape POST /api/admin/cashins/:id/respond uses.
+//
+// requireAdmin sets req.adminId (not req.userId), so these routes are keyed on
+// the admin principal and never accept a user id from the request.
+//
+// Nothing about the ticket holder is returned or logged: no user id, name,
+// phone or balance. The only identity that crosses the boundary is the ticket
+// id, which is needed so an admin can tell two admissions apart.
+
+// A scanned code is the whole credential. The e-ticket QR carries
+// 'paycst:ticket:<code>' (see Ticket.qrPayload in the app), but staff may also
+// type the bare code, so both are accepted.
+const TICKET_QR_PREFIX = 'paycst:ticket:';
+
+// crypto.randomBytes(16).toString('hex') is always exactly 32 lowercase hex
+// characters, so that is the only shape accepted. Returns null for anything
+// else, which callers turn into a 400 before any query runs - an admin scanner
+// must never be able to reach the database with an unvalidated value.
+function parseTicketCode(value) {
+  let code = typeof value === 'string' ? value.trim() : '';
+  if (code.startsWith(TICKET_QR_PREFIX)) code = code.slice(TICKET_QR_PREFIX.length);
+  return /^[0-9a-f]{32}$/.test(code) ? code : null;
+}
+
+// events has no ends_at column, so starts_at is the only anchor available.
+// Redemption stays open for this long after it, which covers same-day scanning
+// and late arrivals without inventing a schema change. Compared in MySQL, never
+// against the Node clock, so a wrong server or device time cannot close or open
+// the window. This is a server constant, not request input - the same pattern
+// CASH_IN_TTL_HOURS already uses in an INTERVAL.
+const TICKET_REDEEM_GRACE_HOURS = 24;
+
+// A gate scanning a busy line is a legitimate burst, so adminLimiter's 10 per
+// 15 minutes (tuned for guessing a login password) would lock staff out
+// mid-queue. This is the same shape as moneyLimiter, keyed on the admin so one
+// noisy admin cannot throttle another.
+const ticketScanLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => (req.adminId ? `a:${req.adminId}` : ipKeyGenerator(req)),
+  message: { error: 'Too many scans in a short time. Please wait a moment.' },
+});
+
+// Read only: tells the admin what they are holding before they redeem it.
+// Deliberately not a status change, so it can be re-run freely.
+app.post('/api/admin/tickets/lookup', requireAdmin, ticketScanLimiter, asyncRoute(async (req, res) => {
+  const code = parseTicketCode(req.body?.code);
+  if (!code) {
+    return res.status(400).json({ error: 'Scan a ticket QR or enter a 32-character ticket code' });
+  }
+
+  const [[row]] = await pool.execute(
+    `SELECT t.id, t.status, t.quantity, t.event_id, t.created_at,
+            e.title, e.venue, e.starts_at,
+            (e.starts_at > (NOW() - INTERVAL ${TICKET_REDEEM_GRACE_HOURS} HOUR)) AS redeemable
+       FROM tickets t
+       JOIN events e ON e.id = t.event_id
+      WHERE t.ticket_code = ?`,
+    [code]
+  );
+  // One generic message for "no such code" and "no such event" so the response
+  // cannot be used to tell a valid code from an invalid one.
+  if (!row) {
+    return res.status(404).json({ error: 'No ticket matches that code' });
+  }
+
+  res.json({
+    ticket: {
+      id: row.id,
+      status: row.status,
+      quantity: row.quantity,
+      eventId: row.event_id,
+      title: row.title,
+      venue: row.venue,
+      startsAt: row.starts_at,
+      createdAt: row.created_at,
+      redeemable: !!row.redeemable,
+    },
+  });
+}));
+
+app.post('/api/admin/tickets/redeem', requireAdmin, ticketScanLimiter, asyncRoute(async (req, res) => {
+  const code = parseTicketCode(req.body?.code);
+  if (!code) {
+    return res.status(400).json({ error: 'Scan a ticket QR or enter a 32-character ticket code' });
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // FOR UPDATE locks the ticket row, so a second admin scanning the same code
+    // blocks here until this transaction finishes and then reads the committed
+    // status. The lock also covers the event row it joins; the transaction is a
+    // single UPDATE and INSERT, so the hold is short enough not to matter.
+    const [[row]] = await conn.query(
+      `SELECT t.id, t.status, t.quantity, t.event_id,
+              e.title, e.venue,
+              (e.starts_at > (NOW() - INTERVAL ${TICKET_REDEEM_GRACE_HOURS} HOUR)) AS redeemable
+         FROM tickets t
+         JOIN events e ON e.id = t.event_id
+        WHERE t.ticket_code = ?
+        FOR UPDATE`,
+      [code]
+    );
+    if (!row) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'No ticket matches that code' });
+    }
+    if (row.status === 'used') {
+      await conn.rollback();
+      // tickets has no used_at column and none is added here: the admin_audit_log
+      // row written at redemption time already records who and when, so a
+      // separate timestamp would only duplicate it.
+      return res.status(409).json({ error: 'This ticket has already been used' });
+    }
+    if (row.status === 'cancelled') {
+      await conn.rollback();
+      return res.status(409).json({ error: 'This ticket was cancelled' });
+    }
+    if (!row.redeemable) {
+      await conn.rollback();
+      return res.status(409).json({ error: 'The redemption window for this event has closed' });
+    }
+
+    // status is re-checked in the UPDATE's own WHERE, so this is the authority
+    // rather than the read above: if anything changed the row between the lock
+    // and here, affectedRows is 0 and the ticket is not marked used.
+    const [result] = await conn.execute(
+      "UPDATE tickets SET status = 'used' WHERE id = ? AND status = 'valid'",
+      [row.id]
+    );
+    if (result.affectedRows !== 1) {
+      await conn.rollback();
+      return res.status(409).json({ error: 'This ticket has already been used' });
+    }
+
+    // Written on the transaction's own connection so the audit row commits with
+    // the status change or not at all. Neither logAdmin nor logAdminEvent can do
+    // this: both use the pool, and logAdminEvent hardcodes target_type
+    // 'admin_login', which is the wrong record type for a redemption.
+    // No ticket code, user id or other personal detail is recorded.
+    await conn.execute(
+      'INSERT INTO admin_audit_log (admin_id, action, target_type, target_id, details, ip) VALUES (?,?,?,?,?,?)',
+      [
+        req.adminId,
+        'ticket_redeem',
+        'ticket',
+        String(row.id),
+        JSON.stringify({ eventId: row.event_id, quantity: row.quantity }),
+        (req.ip || '').toString().slice(0, 64),
+      ]
+    );
+
+    await conn.commit();
+
+    res.json({ ok: true, quantity: row.quantity, title: row.title, venue: row.venue });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}));
+
 // ---------- admin: login + final say on groups (item #13) ----------
 
 // Step 1: password only.
