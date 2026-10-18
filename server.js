@@ -1968,23 +1968,51 @@ app.get('/api/transactions/summary', requireAuth, asyncRoute(async (req, res) =>
   // would be rejected under MySQL's default ONLY_FULL_GROUP_BY. The join runs
   // from that one-row subquery so a user with no matching transactions still
   // gets a row back with real boundaries instead of zeros with null dates.
+  //
+  // spendingOut is the same period and the same account_type = 'user' scope as
+  // moneyOut, narrowed to the server's own definition of spending. It exists
+  // because moneyOut also counts Savings Deposit and group contributions, so it
+  // is the wrong figure to compare a budget against.
+  //
+  // Placeholder order is TEXTUAL: the SPENDING_TYPES list sits in the SELECT
+  // list, so it binds before the period in the FROM subquery and the user id in
+  // the JOIN condition. Read the array below against the SQL text, not the
+  // other way round.
   const [[row]] = await pool.execute(
     `SELECT MIN(b.startAt) AS periodStart,
             MAX(b.endAt) AS periodEnd,
             COALESCE(SUM(CASE WHEN t.is_credit = 1 THEN t.amount ELSE 0 END), 0) AS moneyIn,
             COALESCE(SUM(CASE WHEN t.is_credit = 0 THEN t.amount ELSE 0 END), 0) AS moneyOut,
             COALESCE(SUM(CASE WHEN t.is_credit = 1 THEN 1 ELSE 0 END), 0) AS moneyInCount,
-            COALESCE(SUM(CASE WHEN t.is_credit = 0 THEN 1 ELSE 0 END), 0) AS moneyOutCount
+            COALESCE(SUM(CASE WHEN t.is_credit = 0 THEN 1 ELSE 0 END), 0) AS moneyOutCount,
+            COALESCE(SUM(CASE WHEN t.is_credit = 0 AND t.type IN (${SPENDING_TYPES.map(() => '?').join(',')})
+                              THEN t.amount ELSE 0 END), 0) AS spendingOut
      FROM (SELECT ${SUMMARY_PERIOD_START_SQL} AS startAt, NOW() AS endAt) b
      LEFT JOIN transactions t
        ON t.account_type = 'user' AND t.account_id = ?
         AND t.created_at >= b.startAt AND t.created_at <= b.endAt`,
-    [period, req.userId]
+    [...SPENDING_TYPES, period, req.userId]
   );
+
+  // The budget is read with its own single-row lookup rather than folded into
+  // the aggregate. It is not a function of the period and does not come from
+  // transactions, so putting it beside the SUM() columns would either be
+  // rejected under ONLY_FULL_GROUP_BY or force a MIN()/MAX() wrapper that makes
+  // a plain column look like an aggregate. One primary-key lookup answers it,
+  // scoped to the caller - no user id is ever taken from the request.
+  const [[budgetRow]] = await pool.execute(
+    'SELECT monthly_budget_centavos FROM users WHERE id = ?',
+    [req.userId]
+  );
+  const budgetCentavos = budgetRow?.monthly_budget_centavos ?? null;
 
   // SUM() over a BIGINT column comes back as DECIMAL, which mysql2 hands over
   // as a string, so every figure goes through toCentavos: it parses, rejects
   // anything outside the safe-integer range, and turns a NULL into 0.
+  //
+  // The budget is the one field that must NOT go through that fallback: NULL
+  // means "no budget set" and is a different answer from 0, so a null column
+  // (or a missing row) is passed through as null and never collapses to zero.
   res.json({
     period,
     periodStart: row.periodStart,
@@ -1993,7 +2021,54 @@ app.get('/api/transactions/summary', requireAuth, asyncRoute(async (req, res) =>
     moneyOutCentavos: toCentavos(row.moneyOut),
     moneyInCount: toCentavos(row.moneyInCount),
     moneyOutCount: toCentavos(row.moneyOutCount),
+    spendingOutCentavos: toCentavos(row.spendingOut),
+    monthlyBudgetCentavos: budgetCentavos === null ? null : toCentavos(budgetCentavos),
   });
+}));
+
+// ---------- monthly budget (advisory, never enforced) ----------
+//
+// The user sets a spending target for themselves and sees their progress
+// against it. NOTHING HERE ENFORCES IT: no payment route reads this column, so
+// a user is never blocked from spending and a modified client can ignore it
+// completely. It is a reminder in the app, not a limit on the wallet.
+//
+// requirePin and idempotent are deliberately absent, unlike every money route.
+// A PIN exists so a stolen login token alone cannot drain a wallet, and this
+// writes no money - the worst a stolen token can do here is change an advisory
+// number the user set for themselves. The outgoingLimitError() daily cap is a
+// separate server-enforced limit and is untouched by this.
+//
+// Scoped to req.userId on every statement. No user id is accepted from the
+// request, so one account can never set or read another account's budget.
+app.post('/api/budget', requireAuth, asyncRoute(async (req, res) => {
+  const raw = req.body?.monthlyBudgetCentavos;
+
+  // Only an EXPLICIT null clears the budget. A missing key is a client bug, not
+  // an instruction to delete the user's setting, so it is rejected rather than
+  // silently treated as a clear.
+  if (raw === undefined) {
+    return res.status(400).json({ error: 'monthlyBudgetCentavos is required; send null to clear the budget' });
+  }
+
+  const clearing = raw === null;
+  // parseCentavos is the single validator: it rejects a non-number, a
+  // fractional amount, zero, a negative amount, and anything above
+  // MAX_CENTAVOS, so those all become a clean 400 with nothing written.
+  const centavos = clearing ? null : parseCentavos(raw);
+  if (!clearing && centavos === null) {
+    return res.status(400).json({ error: 'monthlyBudgetCentavos must be a positive whole number of centavos, or null to clear it' });
+  }
+
+  await pool.execute('UPDATE users SET monthly_budget_centavos = ? WHERE id = ?', [centavos, req.userId]);
+
+  // walletAvl, accountList and usersByUsername/usersByWalletId all cache whole
+  // user rows from SELECT *, so they are refreshed in the same request as the
+  // write (item #6 fix). Without this the indexes serve the old budget until
+  // the next boot.
+  await refreshUserInIndex(req.userId);
+
+  res.json({ ok: true, monthlyBudgetCentavos: centavos });
 }));
 
 app.get('/api/groups/mine', requireAuth, asyncRoute(async (req, res) => {
