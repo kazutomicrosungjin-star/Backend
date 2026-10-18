@@ -33,6 +33,11 @@ async function setupDatabase() {
         column: 'reversed_transfer_ref',
         add: 'ADD COLUMN reversed_transfer_ref VARCHAR(64) NULL, ADD KEY idx_tx_reversed (reversed_transfer_ref)',
       },
+      {
+        table: 'users',
+        column: 'monthly_budget_centavos',
+        add: 'ADD COLUMN monthly_budget_centavos BIGINT NULL',
+      },
     ];
     for (const { table, column, add } of missingColumns) {
       const [found] = await conn.query(

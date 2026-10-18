@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS users (
   pin_hash CHAR(60) NOT NULL,
   wallet_id VARCHAR(20) NOT NULL,
   balance BIGINT NOT NULL DEFAULT 0,
+  -- NULL means no budget set. The user sets it themselves; it is a spending
+  -- target, not a cap the server enforces.
+  monthly_budget_centavos BIGINT NULL,
   phone_number VARCHAR(20) NULL,
   government_id_number VARCHAR(64) NULL,
   government_id_photo LONGTEXT NULL,
