@@ -142,6 +142,25 @@ CREATE TABLE IF NOT EXISTS transactions (
   KEY idx_tx_reversed (reversed_transfer_ref)
 ) ENGINE=InnoDB;
 
+-- ---------- payment requests (request money) ----------
+-- Also created at boot by server.js, and the two definitions must stay
+-- identical: schema.sql is the source of truth for a brand-new database, while
+-- server.js creates the table on an existing one. No foreign keys here, so
+-- where this table sits in this file does not matter.
+CREATE TABLE IF NOT EXISTS payment_requests (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  requester_id INT NOT NULL,
+  payer_id INT NOT NULL,
+  amount BIGINT NOT NULL,
+  note VARCHAR(100) NULL,
+  status ENUM('pending','paid','declined','cancelled') NOT NULL DEFAULT 'pending',
+  reference VARCHAR(20) NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  responded_at TIMESTAMP NULL,
+  KEY idx_pr_payer (payer_id, status),
+  KEY idx_pr_requester (requester_id, created_at)
+) ENGINE=InnoDB;
+
 -- ---------- events and tickets ----------
 -- Added after `transactions` so the two commerce tables sit together. Both are
 -- new tables, so CREATE TABLE IF NOT EXISTS creates them on the next boot of a
