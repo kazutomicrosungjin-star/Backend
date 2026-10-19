@@ -1418,7 +1418,13 @@ app.post('/api/wallet/pay', requireAuth, moneyLimiter, idempotent, requirePin, a
   try {
     await conn.beginTransaction();
 
-    const [[found]] = await conn.query('SELECT id FROM users WHERE wallet_id = ?', [walletId]);
+    // status = 'active' so a suspended account cannot be paid, matching what
+    // POST /api/requests already requires. A suspended recipient simply does not
+    // resolve, so it falls into the !recipient branch below and gets the SAME 404
+    // and the same message as a Wallet ID that does not exist - the payment
+    // route must not be usable to find out which Wallet IDs belong to suspended
+    // accounts. No other check, the lock order, or the balance maths changes.
+    const [[found]] = await conn.query("SELECT id FROM users WHERE wallet_id = ? AND status = 'active'", [walletId]);
     const lockIds = [req.userId, ...(found ? [found.id] : [])].sort((a, b) => a - b);
     await conn.query(`SELECT id FROM users WHERE id IN (${lockIds.map(() => '?').join(',')}) ORDER BY id FOR UPDATE`, lockIds);
     const [[sender]] = await conn.query('SELECT id, balance FROM users WHERE id = ?', [req.userId]);
