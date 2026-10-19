@@ -1423,7 +1423,11 @@ app.post('/api/wallet/pay', requireAuth, moneyLimiter, idempotent, requirePin, a
 
     getUndoStack(sender.id).push({ ref: transferRef, at: Date.now() }); // NEW — item: mandatory "Stack"
 
-    res.json({ ok: true, referenceNumber: ref });
+    // recipientName matches what POST /api/send and POST /api/requests/:id/pay
+    // already return. The username was already loaded into `recipient` above, so
+    // this adds nothing to the query and exposes no new column - the payer needs
+    // to see who they paid.
+    res.json({ ok: true, referenceNumber: ref, recipientName: recipient.username });
   } catch (err) {
     await conn.rollback();
     throw err;
