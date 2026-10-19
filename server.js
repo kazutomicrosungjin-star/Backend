@@ -1578,6 +1578,179 @@ async function closeRequest(req, res, who, newStatus) {
 app.post('/api/requests/:id/decline', requireAuth, asyncRoute((req, res) => closeRequest(req, res, 'payer', 'declined')));
 app.post('/api/requests/:id/cancel', requireAuth, asyncRoute((req, res) => closeRequest(req, res, 'requester', 'cancelled')));
 
+// ---------- split a bill ----------
+//
+// One action, N independent payment_requests rows sharing this requester_id.
+// Deliberately no parent table and no group column: the pay, decline, cancel
+// and listing paths above already handle a single request correctly, and
+// keeping the shares independent is what makes them so. It also means a payer
+// receives exactly one row and still cannot learn who else is in the split -
+// nothing here changes requestView or GET /api/requests.
+//
+// Moves no money, so there is no requirePin: a request cannot spend anything.
+//
+// idempotent IS applied, unlike POST /api/requests above. Each row is
+// independently payable, so a retry after a dropped connection would leave the
+// creator able to collect the same share twice. `requireAuth` sets
+// req.userId, which is what idempotency_keys.user_id holds, so this needs no
+// schema change and no change to the middleware.
+const MAX_SPLIT_PARTICIPANTS = 10;
+// Also what stops a share rounding down to zero: with total >= n * 100 the
+// floor can never be below 100.
+const MIN_SPLIT_SHARE_CENTAVOS = 100;
+
+app.post('/api/requests/split', requireAuth, moneyLimiter, idempotent, asyncRoute(async (req, res) => {
+  // ---- validation, all of it before a connection is taken ----
+  const total = parseCentavos(req.body?.totalCentavos);
+  if (total === null) {
+    return res.status(400).json({ error: 'A positive total (integer centavos) is required' });
+  }
+  if (total > LIMITS.perTransactionCentavos) {
+    return res.status(400).json({ error: `You can split at most ${pesoText(LIMITS.perTransactionCentavos)} at a time` });
+  }
+
+  const raw = req.body?.participants;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return res.status(400).json({ error: 'Add at least one person to split with' });
+  }
+  if (raw.length > MAX_SPLIT_PARTICIPANTS) {
+    return res.status(400).json({ error: `A split can have at most ${MAX_SPLIT_PARTICIPANTS} people` });
+  }
+  const entries = raw.map((e) => (typeof e === 'string' ? e.trim() : ''));
+  if (entries.some((e) => !e)) {
+    return res.status(400).json({ error: 'Every person in the split needs a Wallet ID or phone number' });
+  }
+  // cleanText, unlike the single-request route above which only trims and
+  // slices. A split fans one note out to several people, so it is sanitized
+  // here rather than inheriting that gap. POST /api/requests is left alone.
+  const note = cleanText(req.body?.note, 100) || null;
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // One round trip: the same wallet_id OR phone_number resolution the
+    // single-request route does, for every entry at once. status = 'active'
+    // here means a suspended account simply does not come back, which is why
+    // the not-found message below deliberately does not say which it was.
+    const [[found]] = await conn.query(
+      `SELECT id, username, wallet_id, phone_number FROM users
+        WHERE status = 'active'
+          AND (wallet_id IN (${entries.map(() => '?').join(',')})
+               OR phone_number IN (${entries.map(() => '?').join(',')}))`,
+      [...entries, ...entries]
+    );
+    // Both of an account's identifiers point at the same row, so either entry
+    // finds it. A plain Map - this is a lookup table for one request, not a
+    // system of record, so it deliberately does not go in the AVL tree.
+    const byKey = new Map();
+    for (const row of found) {
+      if (row.wallet_id) byKey.set(String(row.wallet_id), row);
+      if (row.phone_number) byKey.set(String(row.phone_number), row);
+    }
+
+    // Resolve every entry before writing anything. Silently dropping someone
+    // who does not resolve would change n and therefore change everybody's
+    // share, so the whole split fails and says which entry was the problem.
+    const picked = [];
+    const seen = new Set();
+    let duplicatesIgnored = 0;
+    for (const entry of entries) {
+      const user = byKey.get(entry);
+      if (!user) {
+        await conn.rollback();
+        return res.status(400).json({ error: `No active account found for "${entry}"` });
+      }
+      if (user.id === req.userId) {
+        await conn.rollback();
+        return res.status(400).json({ error: "You can't request money from yourself" });
+      }
+      // Two different strings can resolve to one account (a phone number and a
+      // wallet ID for the same person), so dedupe on the resolved id.
+      if (seen.has(user.id)) {
+        duplicatesIgnored++;
+        continue;
+      }
+      seen.add(user.id);
+      picked.push(user);
+    }
+
+    const n = picked.length;
+    if (total < n * MIN_SPLIT_SHARE_CENTAVOS) {
+      await conn.rollback();
+      return res.status(400).json({ error: `Each person must owe at least ${pesoText(MIN_SPLIT_SHARE_CENTAVOS)} - raise the total` });
+    }
+
+    // The same 10-open-request ceiling POST /api/requests enforces, kept as a
+    // literal so that route is untouched; change both together if it moves.
+    const [[open]] = await conn.query(
+      "SELECT COUNT(*) AS n FROM payment_requests WHERE requester_id = ? AND status = 'pending'",
+      [req.userId]
+    );
+    const openCount = Number(open.n);
+    if (openCount + n > 10) {
+      await conn.rollback();
+      return res.status(400).json({
+        error: `You have ${openCount} unpaid request${openCount === 1 ? '' : 's'}; a split of ${n} would pass the limit of 10`,
+      });
+    }
+
+    // Integer centavos only, never a float. Sorted by user id so the person who
+    // ends up paying the extra centavo is the same on a retry and does not
+    // depend on the order the client happened to send.
+    picked.sort((a, b) => a.id - b.id);
+    const base = Math.floor(total / n);
+    const extra = total % n;
+    const shares = picked.map((user, i) => ({
+      user,
+      requestId: 0,
+      amountCentavos: base + (i < extra ? 1 : 0),
+    }));
+
+    // Defence in depth: if this ever stopped summing to the total the creator
+    // would be short by a centavo nobody could see. Nothing is written either
+    // way, and this surfaces as a 500 because it would mean the arithmetic is
+    // broken rather than that the caller sent something wrong.
+    const sum = shares.reduce((acc, s) => acc + s.amountCentavos, 0);
+    if (sum !== total) {
+      await conn.rollback();
+      throw new Error('Split shares did not sum to the requested total');
+    }
+
+    // All N inserts on this one connection: either every share exists or none
+    // of them does. A partial split would leave the creator asking some people
+    // for money and not others, with no way to tell which.
+    for (const share of shares) {
+      const [result] = await conn.execute(
+        'INSERT INTO payment_requests (requester_id, payer_id, amount, note) VALUES (?,?,?,?)',
+        [req.userId, share.user.id, share.amountCentavos, note]
+      );
+      share.requestId = result.insertId;
+    }
+
+    await conn.commit();
+
+    // The creator chose these people, so their names and wallet IDs come back
+    // to them. This response is never returned to a payer.
+    res.json({
+      ok: true,
+      totalCentavos: total,
+      duplicatesIgnored,
+      shares: shares.map((s) => ({
+        requestId: s.requestId,
+        username: s.user.username,
+        walletId: s.user.wallet_id,
+        amountCentavos: s.amountCentavos,
+      })),
+    });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}));
+
 // ---------- account limits (shown in the app) ----------
 app.get('/api/limits', requireAuth, asyncRoute(async (req, res) => {
   const used = await spentInLast24h(pool, req.userId);
