@@ -1529,7 +1529,9 @@ function requestView(row, mine) {
 app.post('/api/requests', requireAuth, moneyLimiter, asyncRoute(async (req, res) => {
   const walletId = String(req.body?.walletId || '').trim();
   const amt = parseCentavos(req.body?.amountCentavos);
-  const note = String(req.body?.note || '').trim().slice(0, 100);
+  // cleanText, like the split route below: it strips <, > and control
+  // characters, so a note can never carry HTML into a client.
+  const note = cleanText(req.body?.note, 100);
   if (!walletId || amt === null) {
     return res.status(400).json({ error: 'Enter who to ask and an amount' });
   }
@@ -1678,9 +1680,9 @@ app.post('/api/requests/split', requireAuth, moneyLimiter, idempotent, asyncRout
   if (entries.some((e) => !e)) {
     return res.status(400).json({ error: 'Every person in the split needs a Wallet ID or phone number' });
   }
-  // cleanText, unlike the single-request route above which only trims and
-  // slices. A split fans one note out to several people, so it is sanitized
-  // here rather than inheriting that gap. POST /api/requests is left alone.
+  // cleanText, the same as the single-request route above: it strips <, > and
+  // control characters so a note can never carry HTML into a client. A split
+  // fans one note out to several people, so this matters twice as much here.
   const note = cleanText(req.body?.note, 100) || null;
 
   const conn = await pool.getConnection();
