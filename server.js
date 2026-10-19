@@ -1359,6 +1359,54 @@ app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
 
 // ---------- wallet-to-wallet (QR) payment ----------
 
+// Resolves a Wallet ID to the name a payer is about to pay, so the name can be
+// shown BEFORE the PIN prompt. Without it the app can only display the Wallet
+// ID itself, which is text whoever printed the QR chose, so a fake shop QR
+// gives the payer nothing to check against.
+//
+// A Wallet ID is PCST- plus six digits, so the whole space is about a million
+// values: this route is an enumeration target and is rate limited per user for
+// that reason. Unknown, inactive and suspended accounts all answer with the
+// same 404, so it cannot be used to discover which IDs exist or whether one is
+// suspended. Only the two columns below are ever selected, and nothing is
+// logged - not the Wallet ID, not the username.
+//
+// The caller's own Wallet ID answers 200 with their own name: requireAuth has
+// already rejected a suspended caller, and the app blocks paying yourself
+// separately, so treating it as unknown would only make the client's own check
+// unreachable.
+const walletLookupLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => (req.userId ? `u:${req.userId}` : ipKeyGenerator(req)),
+  message: { error: 'Too many lookups in a short time. Please wait a minute and try again.' },
+});
+
+app.get('/api/wallet/lookup', requireAuth, walletLookupLimiter, asyncRoute(async (req, res) => {
+  const walletId = String(req.query?.walletId || '').trim().toUpperCase();
+  // Same shape the app's QR scanner accepts. Rejected before the query runs, so
+  // a malformed value never reaches the database.
+  if (!/^PCST-\d{6}$/.test(walletId)) {
+    return res.status(400).json({ error: 'Enter a Wallet ID in the form PCST-123456' });
+  }
+
+  const [[row]] = await pool.execute(
+    "SELECT wallet_id, username FROM users WHERE wallet_id = ? AND status = 'active' LIMIT 1",
+    [walletId]
+  );
+  // One message for missing, inactive and suspended alike: distinguishing them
+  // would turn this into a probe for which Wallet IDs exist.
+  if (!row) {
+    return res.status(404).json({ error: 'No account found for that Wallet ID' });
+  }
+
+  // Deliberately only the Wallet ID echoed back and the username. No balance,
+  // no phone number, no user id, no status.
+  res.json({ walletId: row.wallet_id, username: row.username });
+}));
+
 app.post('/api/wallet/pay', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const { walletId, amountCentavos } = req.body || {};
   const amt = parseCentavos(amountCentavos);
