@@ -4102,10 +4102,18 @@ app.post('/api/admin/verifications/:id/respond', requireAdmin, asyncRoute(async 
     return res.status(409).json({ error: 'This account has already been decided' });
   }
 
-  await pool.execute('UPDATE users SET verification_status = ? WHERE id = ?', [
-    approve ? 'approved' : 'rejected',
-    userId,
-  ]);
+  // The 'pending' check lives in the WHERE clause, so the DATABASE decides
+  // which admin wins. Two admins deciding the same account at the same time
+  // both run this UPDATE, but only the first one finds a row still in
+  // 'pending' and changes it. The second one gets 0 affected rows and is
+  // turned away below instead of overwriting the first decision.
+  const [decision] = await pool.execute(
+    "UPDATE users SET verification_status = ? WHERE id = ? AND verification_status = 'pending'",
+    [approve ? 'approved' : 'rejected', userId]
+  );
+  if (decision.affectedRows === 0) {
+    return res.status(409).json({ error: 'This account has already been decided' });
+  }
   // The photos were only needed for this review. Delete them once decided.
   if (!KEEP_ID_PHOTOS) {
     await pool.execute(
