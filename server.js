@@ -1970,6 +1970,131 @@ app.get('/api/notifications', requireAuth, asyncRoute(async (req, res) => {
   res.json(rows.map((row) => ({ ...row, amount: toCentavos(row.amount) })));
 }));
 
+// ---------- alerts: what is waiting for this user ----------
+//
+// A small read-only counter set for the client to poll. It returns COUNTS
+// ONLY - never a name, an amount, an id or a label - and every query is
+// scoped to the caller, so the response can never carry another person's
+// data.
+//
+// The client must not use its own clock. It stores the serverTime it is given
+// and sends it back as ?since=<serverTime>, and the counts are computed
+// against that value here, in the database.
+
+const alertsLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => (req.userId ? `u:${req.userId}` : ipKeyGenerator(req)),
+  message: { error: 'Too many alert checks in a short time. Please wait a minute and try again.' },
+});
+
+// A well-formed ISO-8601 instant with a timezone. Anything else is ignored
+// rather than rejected, so a stale or hand-edited value can never turn into
+// an error page - and the value only ever reaches MySQL as a bound
+// parameter, never as SQL text.
+const ISO_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$/;
+
+// How far back a cursor is honoured. A month of history is plenty for a
+// badge, and it keeps one stale cursor from scanning the whole table.
+const ALERTS_MAX_LOOKBACK_MS = 30 * 24 * 60 * 60 * 1000;
+
+// Reads the ?since= cursor. Returns null when there is no usable baseline,
+// which the route reads as "no count yet", never as a guess.
+function parseSinceCursor(raw) {
+  if (typeof raw !== 'string' || !ISO_INSTANT_RE.test(raw)) return null;
+  const ms = Date.parse(raw);
+  if (!Number.isFinite(ms)) return null;
+  return new Date(ms);
+}
+
+// Clamps the cursor against the server's own clock: one from the future is
+// treated as now, and one older than 30 days is treated as 30 days ago.
+function clampSinceCursor(since, serverNowMs) {
+  if (since === null) return null;
+  if (since.getTime() > serverNowMs) return new Date(serverNowMs);
+  const oldest = serverNowMs - ALERTS_MAX_LOOKBACK_MS;
+  if (since.getTime() < oldest) return new Date(oldest);
+  return since;
+}
+
+// COUNT(*) comes back from MySQL as a BIGINT, which the driver hands over as
+// a string. It is normalised to a plain integer before it leaves the server.
+function countValue(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+app.get('/api/alerts', requireAuth, alertsLimiter, asyncRoute(async (req, res) => {
+  // One query for the counts that are always needed. Every subquery is a
+  // COUNT over rows the caller owns, so nothing about anyone else can come
+  // back in the response.
+  //   payment_requests - idx_pr_payer (payer_id, status) covers both parts
+  //   group_withdraw_requests - idx_gwr_group (group_id, status), joined
+  //     from group_members through idx_member_user (user_id); the NOT EXISTS
+  //     probe hits uniq_member_request (request_id, member_id)
+  // The group rules mirror the vote route exactly: the request must still be
+  // pending, the user must be a member, the user must not be the requester
+  // (they cannot vote on their own request), and the user must not have
+  // voted already.
+  const [[counts]] = await pool.execute(
+    `SELECT NOW() AS serverTime,
+            (SELECT COUNT(*) FROM payment_requests
+              WHERE payer_id = ? AND status = 'pending') AS pendingIncomingRequests,
+            (SELECT COUNT(*)
+               FROM group_withdraw_requests r
+               JOIN group_members m ON m.group_id = r.group_id AND m.user_id = ?
+              WHERE r.status = 'pending'
+                AND r.requester_id <> ?
+                AND NOT EXISTS (
+                  SELECT 1 FROM group_withdraw_approvals a
+                   WHERE a.request_id = r.id AND a.member_id = ?
+                )) AS pendingGroupVotes`,
+    [req.userId, req.userId, req.userId, req.userId]
+  );
+
+  // The server's own clock, in UTC, so the client can hand it back instead
+  // of trusting the clock on the phone.
+  const serverNowMs = new Date(counts.serverTime).getTime();
+  const serverTime = new Date(serverNowMs).toISOString();
+
+  // Money that arrived from another person or a group since the client's last
+  // call. The types are the ones where the money came from somebody else:
+  //   Send Money       - a received send, or a request the other person paid
+  //   QR Payment       - a QR payment received
+  //   Group Withdrawal - the group paid the withdrawal out to the user
+  // The user's own credits are left out on purpose: a cash in, a loan
+  // disbursement and a savings withdrawal are things the user did, not
+  // things that arrived. The credit an undo writes back is left out too,
+  // through reversed_transfer_ref IS NULL - a reversal carries the type of
+  // the row it reverses, so a reversed send would otherwise look like a
+  // received one.
+  const since = clampSinceCursor(parseSinceCursor(req.query.since), serverNowMs);
+  let newMoneyIn = 0;
+  if (since) {
+    const [[money]] = await pool.execute(
+      `SELECT COUNT(*) AS n
+         FROM transactions
+        WHERE account_type = 'user'
+          AND account_id = ?
+          AND is_credit = 1
+          AND type IN ('Send Money', 'QR Payment', 'Group Withdrawal')
+          AND reversed_transfer_ref IS NULL
+          AND created_at > ?`,
+      [req.userId, since]
+    );
+    newMoneyIn = countValue(money.n);
+  }
+
+  res.json({
+    pendingIncomingRequests: countValue(counts.pendingIncomingRequests),
+    pendingGroupVotes: countValue(counts.pendingGroupVotes),
+    newMoneyIn,
+    serverTime,
+  });
+}));
+
 app.post('/api/send', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const recipient = req.body?.recipient?.toString().trim();
   const amt = parseCentavos(req.body?.amountCentavos);
