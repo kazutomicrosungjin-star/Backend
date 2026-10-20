@@ -1427,7 +1427,10 @@ app.post('/api/wallet/pay', requireAuth, moneyLimiter, idempotent, requirePin, a
     const [[found]] = await conn.query("SELECT id FROM users WHERE wallet_id = ? AND status = 'active'", [walletId]);
     const lockIds = [req.userId, ...(found ? [found.id] : [])].sort((a, b) => a - b);
     await conn.query(`SELECT id FROM users WHERE id IN (${lockIds.map(() => '?').join(',')}) ORDER BY id FOR UPDATE`, lockIds);
-    const [[sender]] = await conn.query('SELECT id, balance FROM users WHERE id = ?', [req.userId]);
+    // username is loaded here so the receiver's row can name the sender
+    // instead of printing their numeric user id. Same row, same read - no
+    // extra query, and the label below is the only thing that uses it.
+    const [[sender]] = await conn.query('SELECT id, username, balance FROM users WHERE id = ?', [req.userId]);
     const [[recipient]] = found
       ? await conn.query('SELECT id, username, balance FROM users WHERE id = ?', [found.id])
       : [[undefined]];
@@ -1463,7 +1466,7 @@ app.post('/api/wallet/pay', requireAuth, moneyLimiter, idempotent, requirePin, a
     );
     await conn.execute(
       'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref, details) VALUES (?,?,?,?,?,?,?,?)',
-      ['user', recipient.id, `QR Payment from user #${sender.id}`, 'QR Payment', amt, 1, transferRef, referenceDetails(ref)]
+      ['user', recipient.id, `QR Payment from ${cleanText(sender.username, 60)}`, 'QR Payment', amt, 1, transferRef, referenceDetails(ref)]
     );
 
     await conn.commit();
@@ -1980,7 +1983,10 @@ app.post('/api/send', requireAuth, moneyLimiter, idempotent, requirePin, asyncRo
     const [[found]] = await conn.query('SELECT id FROM users WHERE wallet_id = ?', [recipient]);
     const lockIds = [req.userId, ...(found ? [found.id] : [])].sort((a, b) => a - b);
     await conn.query(`SELECT id FROM users WHERE id IN (${lockIds.map(() => '?').join(',')}) ORDER BY id FOR UPDATE`, lockIds);
-    const [[sender]] = await conn.query('SELECT id, balance FROM users WHERE id = ?', [req.userId]);
+    // username is loaded here so the receiver's row can name the sender
+    // instead of printing their numeric user id. Same row, same read - no
+    // extra query, and the label below is the only thing that uses it.
+    const [[sender]] = await conn.query('SELECT id, username, balance FROM users WHERE id = ?', [req.userId]);
     const [[recipientUser]] = found
       ? await conn.query('SELECT id, username, balance FROM users WHERE id = ?', [found.id])
       : [[undefined]];
@@ -2018,7 +2024,7 @@ app.post('/api/send', requireAuth, moneyLimiter, idempotent, requirePin, asyncRo
     );
     await conn.execute(
       'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref, details) VALUES (?,?,?,?,?,?,?,?)',
-      ['user', recipientUser.id, `Received from user #${sender.id}`, 'Send Money', amt, 1, transferRef, referenceDetails(ref)]
+      ['user', recipientUser.id, `Received from ${cleanText(sender.username, 60)}`, 'Send Money', amt, 1, transferRef, referenceDetails(ref)]
     );
 
     await conn.commit();
@@ -2651,13 +2657,17 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, m
     if (approvals >= approvalsNeeded) {
       const amt = toCentavos(request.amount);
 
-      const [[group]] = await conn.query('SELECT balance FROM `groups` WHERE id = ? FOR UPDATE', [groupId]);
+      // name and username are loaded here so the two rows below can name the
+      // group and the requester instead of printing a group id and a user id.
+      // Both are columns on rows this route already reads and locks, so this
+      // is no extra query and no change to the lock order.
+      const [[group]] = await conn.query('SELECT name, balance FROM `groups` WHERE id = ? FOR UPDATE', [groupId]);
       if (toCentavos(group.balance) < amt) {
         await conn.rollback();
         return res.status(400).json({ error: 'Group balance too low to complete this withdrawal now' });
       }
 
-      const [[requester]] = await conn.query('SELECT balance FROM users WHERE id = ? FOR UPDATE', [request.requester_id]);
+      const [[requester]] = await conn.query('SELECT username, balance FROM users WHERE id = ? FOR UPDATE', [request.requester_id]);
       const capError = recipientCapError(toCentavos(requester.balance), amt);
       if (capError) {
         await conn.rollback();
@@ -2669,11 +2679,11 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, m
       await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, request.requester_id]);
       await conn.execute(
         'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
-        ['group', groupId, `Withdrawal to user #${request.requester_id} (approved)`, 'Group Withdrawal', amt, 0]
+        ['group', groupId, `Withdrawal to ${cleanText(requester.username, 60)} (approved)`, 'Group Withdrawal', amt, 0]
       );
       await conn.execute(
         'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
-        ['user', request.requester_id, `Group withdrawal from #${groupId}`, 'Group Withdrawal', amt, 1]
+        ['user', request.requester_id, `Group withdrawal from ${cleanText(group.name, 100)}`, 'Group Withdrawal', amt, 1]
       );
       await conn.execute("UPDATE group_withdraw_requests SET status = 'approved' WHERE id = ?", [reqId]);
 
@@ -2708,7 +2718,10 @@ app.post('/api/groups/:id/contribute', requireAuth, moneyLimiter, idempotent, re
       await conn.rollback();
       return res.status(403).json({ error: 'Not a member of this group' });
     }
-    const [[user]] = await conn.query('SELECT balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    // username is loaded here so the group-side row below can name the
+    // contributor instead of printing their numeric user id. Same row, same
+    // read - no extra query and no change to the lock order.
+    const [[user]] = await conn.query('SELECT username, balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
     if (toCentavos(user.balance) < amt) {
       await conn.rollback();
       return res.status(400).json({ error: 'Insufficient balance' });
@@ -2723,14 +2736,15 @@ app.post('/api/groups/:id/contribute', requireAuth, moneyLimiter, idempotent, re
     await conn.execute('UPDATE `groups` SET balance = balance + ? WHERE id = ?', [amt, groupId]);
     await conn.execute(
       'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
-      ['group', groupId, `Contribution from user #${req.userId}`, 'Contribution', amt, 1]
+      ['group', groupId, `Contribution from ${cleanText(user.username, 60)}`, 'Contribution', amt, 1]
     );
     // The user's own half of the same movement. Without this row the wallet is
     // debited with nothing in its own history, so Money out and
     // /transactions/summary both under-report. Mirrors the paired insert in the
     // withdrawal route. No transfer_ref, so /api/undo cannot reach it - group
-    // flows are not undoable. The group name is not loaded here, so the label
-    // names the group by id like the sibling row does.
+    // flows are not undoable. The group name is not loaded here and is not
+    // worth a query of its own for one label, so this row names the group by
+    // id while the withdrawal route, which already has the name, uses it.
     await conn.execute(
       'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
       ['user', req.userId, `Contribution to group #${groupId}`, 'Contribution', amt, 0]
@@ -3842,7 +3856,7 @@ app.post('/api/loans/:id/repay', requireAuth, moneyLimiter, idempotent, requireP
     ]);
     await conn.execute(
       'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
-      ['user', req.userId, `Loan Repayment (Loan #${loanId})`, 'Loan Repayment', applied, 0]
+      ['user', req.userId, `Loan Repayment (${cleanText(loan.loan_type, 40)})`, 'Loan Repayment', applied, 0]
     );
 
     await conn.commit();
