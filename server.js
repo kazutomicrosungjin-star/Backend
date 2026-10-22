@@ -819,6 +819,11 @@ const OTP_TTL_SECONDS = 5 * 60;
 const OTP_RESEND_SECONDS = 60;
 const OTP_MAX_ATTEMPTS = 5;
 const OTP_MAX_SENDS_PER_HOUR = 5;
+// Global cap across all numbers, separate from the per-number limit above.
+const SMS_MAX_SENDS_PER_HOUR = (() => {
+  const parsed = Number(process.env.SMS_MAX_SENDS_PER_HOUR);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 100;
+})();
 // Turn off only for local testing of old app builds: REQUIRE_PHONE_OTP=false
 const REQUIRE_PHONE_OTP = process.env.REQUIRE_PHONE_OTP !== 'false';
 // Dev mode: with no SMS provider set, the code is returned to the app so the demo works.
@@ -889,6 +894,13 @@ app.post('/api/phone/send-otp', otpSendLimiter, asyncRoute(async (req, res) => {
   );
   if (hourly[0].n >= OTP_MAX_SENDS_PER_HOUR) {
     return res.status(429).json({ error: 'Too many codes sent to this number. Please try again in an hour.' });
+  }
+  const [recentTotal] = await pool.execute(
+    'SELECT COUNT(*) AS n FROM phone_otps WHERE created_at > (NOW() - INTERVAL 1 HOUR)'
+  );
+  if (recentTotal[0].n >= SMS_MAX_SENDS_PER_HOUR) {
+    console.warn('OTP SMS hourly cap reached');
+    return res.status(429).json({ error: 'Too many requests right now. Please try again later.' });
   }
 
   const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
