@@ -1353,7 +1353,7 @@ app.post('/api/device/revoke', requireAuth, asyncRoute(async (req, res) => {
 // out carry the old `sv`, and requireAuth rejects any token whose `sv` no
 // longer matches users.session_version. A fresh token is returned so the
 // caller - who just re-proved the PIN - is not logged out by its own request.
-app.post('/api/auth/revoke-all', requireAuth, requirePin, idempotent, asyncRoute(async (req, res) => {
+app.post('/api/auth/revoke-all', requireAuth, requirePin, asyncRoute(async (req, res) => {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -1386,7 +1386,7 @@ app.post('/api/auth/revoke-all', requireAuth, requirePin, idempotent, asyncRoute
 // lockout counter as login and money actions, so this cannot be used as an
 // unthrottled guessing oracle. A PIN change invalidates every other session
 // and every enrolled fingerprint phone, then hands the caller a fresh token.
-app.post('/api/auth/change-pin', requireAuth, idempotent, pinLimiter, asyncRoute(async (req, res) => {
+app.post('/api/auth/change-pin', requireAuth, pinLimiter, asyncRoute(async (req, res) => {
   const { currentPin, newPin } = req.body || {};
   if (typeof currentPin !== 'string' || !/^\d{4}$/.test(currentPin)) {
     return res.status(400).json({ error: 'Enter your current 4-digit PIN' });
