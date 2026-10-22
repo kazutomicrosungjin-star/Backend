@@ -1442,6 +1442,21 @@ app.post('/api/auth/change-pin', requireAuth, idempotent, pinLimiter, asyncRoute
   }
 }));
 
+// The fingerprint phones enrolled on this account. Only metadata leaves the
+// server: token_hash is the credential these rows exist to protect, so it is
+// never selected and never returned. expires_at is included so the client can
+// tell a live enrollment from one that has already lapsed.
+app.get('/api/auth/devices', requireAuth, asyncRoute(async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT id, device_name, created_at, last_used_at, expires_at
+       FROM device_tokens
+      WHERE user_id = ?
+      ORDER BY created_at DESC`,
+    [req.userId]
+  );
+  res.json(rows);
+}));
+
 app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute('SELECT id, username, wallet_id, balance FROM users WHERE id = ?', [req.userId]);
   if (!rows[0]) return res.status(404).json({ error: 'User not found' });
