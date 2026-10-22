@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS users (
   verification_status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
   face_match_confidence DOUBLE NULL,
   status ENUM('active','suspended') NOT NULL DEFAULT 'active',
+  session_version INT NOT NULL DEFAULT 0,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE KEY uniq_users_username (username),
   UNIQUE KEY uniq_users_wallet (wallet_id),

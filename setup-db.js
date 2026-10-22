@@ -38,6 +38,11 @@ async function setupDatabase() {
         column: 'monthly_budget_centavos',
         add: 'ADD COLUMN monthly_budget_centavos BIGINT NULL',
       },
+      {
+        table: 'users',
+        column: 'session_version',
+        add: 'ADD COLUMN session_version INT NOT NULL DEFAULT 0',
+      },
     ];
     for (const { table, column, add } of missingColumns) {
       const [found] = await conn.query(
