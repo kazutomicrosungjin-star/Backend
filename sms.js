@@ -21,10 +21,11 @@ async function sendSms(phoneNumber, message) {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: form,
+    signal: AbortSignal.timeout(10000),
   });
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Semaphore error ${res.status}: ${text.slice(0, 200)}`);
+    await res.text().catch(() => '');
+    throw new Error(`Semaphore error ${res.status}`);
   }
   return { delivered: true, dev: false };
 }
