@@ -1382,6 +1382,66 @@ app.post('/api/auth/revoke-all', requireAuth, requirePin, idempotent, asyncRoute
   }
 }));
 
+// Changes the wallet PIN. The current PIN is verified with the same durable
+// lockout counter as login and money actions, so this cannot be used as an
+// unthrottled guessing oracle. A PIN change invalidates every other session
+// and every enrolled fingerprint phone, then hands the caller a fresh token.
+app.post('/api/auth/change-pin', requireAuth, idempotent, pinLimiter, asyncRoute(async (req, res) => {
+  const { currentPin, newPin } = req.body || {};
+  if (typeof currentPin !== 'string' || !/^\d{4}$/.test(currentPin)) {
+    return res.status(400).json({ error: 'Enter your current 4-digit PIN' });
+  }
+  // Same rule as registration.
+  if (typeof newPin !== 'string' || !/^\d{4}$/.test(newPin)) {
+    return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
+  }
+  if (newPin === currentPin) {
+    return res.status(400).json({ error: 'The new PIN must be different from the current PIN' });
+  }
+
+  const identifier = `pin:${req.userId}`;
+  const lockedForSeconds = await checkLockout(identifier);
+  if (lockedForSeconds !== null) {
+    return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedForSeconds} second(s).` });
+  }
+  const [[user]] = await pool.query('SELECT pin_hash FROM users WHERE id = ?', [req.userId]);
+  const ok = await bcrypt.compare(currentPin, user ? user.pin_hash : DUMMY_BCRYPT_HASH);
+  if (!ok) {
+    await recordFailedAttempt(identifier);
+    return res.status(401).json({ error: 'Incorrect PIN' });
+  }
+  await clearAttempts(identifier);
+
+  // Same bcrypt cost as registration.
+  const pinHash = await bcrypt.hash(newPin, 10);
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.execute('UPDATE users SET pin_hash = ?, session_version = session_version + 1 WHERE id = ?', [pinHash, req.userId]);
+    await conn.execute('DELETE FROM device_tokens WHERE user_id = ?', [req.userId]);
+    // Same connection and transaction as the writes above, so the token is
+    // signed with the version that is actually committed.
+    const [[row]] = await conn.query(
+      'SELECT id, username, wallet_id, balance, session_version FROM users WHERE id = ?',
+      [req.userId]
+    );
+    if (!row) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'User not found' });
+    }
+    await conn.commit();
+    res.json({
+      token: sign({ uid: row.id, stage: 'full', role: 'user', sv: row.session_version }, '2h'),
+      user: { id: row.id, username: row.username, walletId: row.wallet_id, balance: toCentavos(row.balance) },
+    });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}));
+
 app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute('SELECT id, username, wallet_id, balance FROM users WHERE id = ?', [req.userId]);
   if (!rows[0]) return res.status(404).json({ error: 'User not found' });
