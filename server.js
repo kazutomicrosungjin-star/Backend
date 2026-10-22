@@ -1348,6 +1348,40 @@ app.post('/api/device/revoke', requireAuth, asyncRoute(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// Kills every live session and every enrolled fingerprint phone for this
+// account. The version bump is the part that matters: tokens already handed
+// out carry the old `sv`, and requireAuth rejects any token whose `sv` no
+// longer matches users.session_version. A fresh token is returned so the
+// caller - who just re-proved the PIN - is not logged out by its own request.
+app.post('/api/auth/revoke-all', requireAuth, requirePin, idempotent, asyncRoute(async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.execute('UPDATE users SET session_version = session_version + 1 WHERE id = ?', [req.userId]);
+    await conn.execute('DELETE FROM device_tokens WHERE user_id = ?', [req.userId]);
+    // Read the new version on the same connection and inside the transaction,
+    // so the token below is signed with exactly the value that was committed.
+    const [[row]] = await conn.query(
+      'SELECT id, username, wallet_id, balance, session_version FROM users WHERE id = ?',
+      [req.userId]
+    );
+    if (!row) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'User not found' });
+    }
+    await conn.commit();
+    res.json({
+      token: sign({ uid: row.id, stage: 'full', role: 'user', sv: row.session_version }, '2h'),
+      user: { id: row.id, username: row.username, walletId: row.wallet_id, balance: toCentavos(row.balance) },
+    });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}));
+
 app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute('SELECT id, username, wallet_id, balance FROM users WHERE id = ?', [req.userId]);
   if (!rows[0]) return res.status(404).json({ error: 'User not found' });
