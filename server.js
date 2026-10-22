@@ -4572,7 +4572,8 @@ const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 4096 });
 // and server logs). The client connects, then must send
 //   {"type":"auth","token":"<jwt>"}
 // as its first message within 5 seconds, or it is disconnected. The token is
-// checked with the same rules as requireAuth: full stage, user role.
+// checked with the same rules as requireAuth: full stage, user role, an
+// unsuspended account, and a current session version.
 wss.on('connection', (ws) => {
   ws.isAlive = true;
   ws.on('pong', () => {
@@ -4582,13 +4583,22 @@ wss.on('connection', (ws) => {
   ws.on('close', () => clearTimeout(authTimer));
   ws.on('error', () => clearTimeout(authTimer));
 
-  ws.once('message', (data) => {
+  ws.once('message', async (data) => {
     clearTimeout(authTimer);
     let userId;
     try {
       const msg = JSON.parse(data.toString());
       const payload = msg && msg.type === 'auth' ? verify(msg.token) : null;
       if (!payload || payload.stage !== 'full' || payload.role !== 'user') {
+        ws.close(4001, 'Not authenticated');
+        return;
+      }
+      // Same revocation rule as requireAuth: the token's session version must
+      // still match the account, and a suspended account is refused. Every
+      // rejection reuses the close code above, so the client has one failure
+      // path and nothing about account status is exposed.
+      const [[row]] = await pool.query('SELECT status, session_version FROM users WHERE id = ?', [payload.uid]);
+      if (!row || row.status === 'suspended' || (payload.sv ?? 0) !== row.session_version) {
         ws.close(4001, 'Not authenticated');
         return;
       }
