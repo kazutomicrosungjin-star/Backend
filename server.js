@@ -495,10 +495,13 @@ async function requireAuth(req, res, next) {
     }
     // Suspension must take effect immediately, not only at the next login -
     // a 2h token issued before suspension would otherwise keep working.
-    const [[row]] = await pool.query('SELECT status FROM users WHERE id = ?', [payload.uid]);
+    const [[row]] = await pool.query('SELECT status, session_version FROM users WHERE id = ?', [payload.uid]);
     if (!row) return res.status(401).json({ error: 'Not authenticated' });
     if (row.status === 'suspended') {
       return res.status(403).json({ error: 'This account has been suspended. Contact support for assistance.' });
+    }
+    if ((payload.sv ?? 0) !== row.session_version) {
+      return res.status(401).json({ error: 'Not authenticated' });
     }
     req.userId = payload.uid;
     next();
@@ -1238,7 +1241,7 @@ app.post('/api/login/verify-pin', pinLimiter, asyncRoute(async (req, res) => {
     return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedForSeconds} second(s).` });
   }
 
-  const [rows] = await pool.execute('SELECT id, username, wallet_id, pin_hash, balance FROM users WHERE id = ?', [
+  const [rows] = await pool.execute('SELECT id, username, wallet_id, pin_hash, balance, session_version FROM users WHERE id = ?', [
     payload.uid,
   ]);
   const user = rows[0];
@@ -1249,7 +1252,7 @@ app.post('/api/login/verify-pin', pinLimiter, asyncRoute(async (req, res) => {
   }
   await clearAttempts(identifier);
 
-  const token = sign({ uid: user.id, stage: 'full', role: 'user' }, '2h');
+  const token = sign({ uid: user.id, stage: 'full', role: 'user', sv: user.session_version }, '2h');
   res.json({
     token,
     // balance is returned as an integer count of centavos — the client
@@ -1305,7 +1308,7 @@ app.post('/api/login/device', deviceLoginLimiter, asyncRoute(async (req, res) =>
   }
   const oldHash = sha256(deviceToken);
   const [[row]] = await pool.query(
-    `SELECT d.id AS device_id, u.id, u.username, u.wallet_id, u.balance, u.status, u.verification_status
+    `SELECT d.id AS device_id, u.id, u.username, u.wallet_id, u.balance, u.status, u.verification_status, u.session_version
        FROM device_tokens d JOIN users u ON u.id = d.user_id
       WHERE d.token_hash = ? AND d.expires_at > NOW()`,
     [oldHash]
@@ -1328,7 +1331,7 @@ app.post('/api/login/device', deviceLoginLimiter, asyncRoute(async (req, res) =>
   if (swap.affectedRows !== 1) return res.status(401).json(expired);
 
   res.json({
-    token: sign({ uid: row.id, stage: 'full', role: 'user' }, '2h'),
+    token: sign({ uid: row.id, stage: 'full', role: 'user', sv: row.session_version }, '2h'),
     deviceToken: newToken,
     user: { id: row.id, username: row.username, walletId: row.wallet_id, balance: toCentavos(row.balance) },
   });
