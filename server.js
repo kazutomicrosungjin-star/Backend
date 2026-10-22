@@ -906,7 +906,7 @@ app.post('/api/phone/send-otp', otpSendLimiter, asyncRoute(async (req, res) => {
   const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
   // Older codes for this number stop working as soon as a new one is issued.
   await pool.execute('UPDATE phone_otps SET consumed = 1 WHERE phone_number = ? AND consumed = 0', [phoneNumber]);
-  await pool.execute(
+  const [result] = await pool.execute(
     `INSERT INTO phone_otps (phone_number, code_hash, expires_at)
      VALUES (?, ?, NOW() + INTERVAL ${OTP_TTL_SECONDS} SECOND)`,
     [phoneNumber, hashOtp(phoneNumber, code)]
@@ -916,7 +916,7 @@ app.post('/api/phone/send-otp', otpSendLimiter, asyncRoute(async (req, res) => {
     await sendSms(phoneNumber, `Your PayCST verification code is ${code}. It expires in 5 minutes. Do not share it with anyone.`);
   } catch (err) {
     console.error('SMS send failed:', err.message);
-    await pool.execute('UPDATE phone_otps SET consumed = 1 WHERE phone_number = ? AND consumed = 0', [phoneNumber]);
+    await pool.execute('DELETE FROM phone_otps WHERE id = ?', [result.insertId]);
     return res.status(502).json({ error: 'We could not send the text message. Please try again in a moment.' });
   }
 
