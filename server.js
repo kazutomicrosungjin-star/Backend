@@ -865,6 +865,9 @@ app.post('/api/phone/send-otp', otpSendLimiter, asyncRoute(async (req, res) => {
   if (typeof phoneNumber !== 'string' || !/^09\d{9}$/.test(phoneNumber)) {
     return res.status(400).json({ error: 'Phone number must be 11 digits starting with 09 (e.g. 09171234567)' });
   }
+  if (!smsIsReal && !OTP_DEV_MODE) {
+    return res.status(503).json({ error: 'Phone verification is not configured' });
+  }
   const [taken] = await pool.execute('SELECT id FROM users WHERE phone_number = ? OR wallet_id = ?', [phoneNumber, phoneNumber]);
   if (taken.length > 0) {
     return res.status(409).json({ error: 'That phone number is already registered to an account' });
