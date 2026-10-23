@@ -123,8 +123,10 @@ app.use(cors({ origin: corsOrigins || true }));
 // that route was almost certainly failing with a 413 before this. 15mb
 // gives real photos room while still capping the body so a client can't
 // send an unbounded payload as a cheap DoS.
-// Large body (ID + selfie photos) only on registration; everything else 100kb.
+// Large body (ID + selfie photos) only on registration and verification
+// upgrades; everything else 100kb.
 app.use('/api/register', express.json({ limit: '15mb' }));
+app.use('/api/verification/upgrade', express.json({ limit: '15mb' }));
 app.use(express.json({ limit: '100kb' }));
 
 // Rate limiting on the endpoints most worth protecting against
@@ -520,6 +522,18 @@ const moneyLimiter = rateLimit({
   legacyHeaders: false,
   keyGenerator: (req) => (req.userId ? `u:${req.userId}` : ipKeyGenerator(req)),
   message: { error: 'Too many payments in a short time. Please wait a minute and try again.' },
+});
+
+// Verification upgrades upload three photos and call Face++, so throttle them
+// per account like the login-adjacent routes (not by IP, since requireAuth
+// runs first).
+const verificationUpgradeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => (req.userId ? `verification-upgrade:${req.userId}` : ipKeyGenerator(req)),
+  message: { error: 'Too many verification upgrade attempts. Please try again later.' },
 });
 
 // Records what each admin did. Best effort: a logging problem never blocks the action.
@@ -1133,6 +1147,19 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
       verificationStatus = 'pending';
     }
 
+    // Informational only: this does not decide whether the account is approved.
+    // The current app has one `needsManualReview` flag for "typed ID or skipped
+    // liveness", so the conservative value is 'skipped'. Browser sign-up also
+    // has no real liveness step and reports verificationMethod 'web'.
+    const livenessSkipped =
+      req.body?.needsManualReview === true ||
+      req.body?.livenessSkipped === true ||
+      req.body?.skipped === true ||
+      req.body?.livenessPassed === false ||
+      req.body?.livenessStatus === 'skipped' ||
+      verificationMethod === 'web';
+    const livenessStatus = livenessSkipped ? 'skipped' : 'passed';
+
     const passwordHash = await bcrypt.hash(password, 10);
     const pinHash = await bcrypt.hash(pin, 10);
     const walletId = phoneNumber;
@@ -1143,12 +1170,12 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
       `INSERT INTO users
          (username, password_hash, pin_hash, wallet_id, balance, phone_number,
           government_id_number, government_id_photo, government_id_photo_back, selfie_photo,
-          terms_accepted_at, verification_status, face_match_confidence)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)`,
+          terms_accepted_at, verification_status, liveness_status, face_match_confidence)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?)`,
       [
         username, passwordHash, pinHash, walletId, 0, phoneNumber,
         normalizedId, encryptPhoto(governmentIdPhotoFrontBase64), encryptPhoto(governmentIdPhotoBackBase64), encryptPhoto(selfiePhotoBase64),
-        verificationStatus, confidence,
+        verificationStatus, livenessStatus, confidence,
       ]
     );
     } catch (err) {
@@ -1473,15 +1500,178 @@ app.get('/api/auth/devices', requireAuth, asyncRoute(async (req, res) => {
 }));
 
 app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
-  const [rows] = await pool.execute('SELECT id, username, wallet_id, balance FROM users WHERE id = ?', [req.userId]);
+  const [rows] = await pool.execute(
+    'SELECT id, username, wallet_id, balance, verification_level, liveness_status FROM users WHERE id = ?',
+    [req.userId]
+  );
   if (!rows[0]) return res.status(404).json({ error: 'User not found' });
   const u = rows[0];
+
+  // A fully verified account has no upgrade badge. Otherwise the latest
+  // upgrade row decides it: 'approved' is represented by
+  // verification.level = 'fully_verified', so only pending/rejected map back
+  // here (the requested upgradeStatus vocabulary is none | pending | rejected).
+  const [[latestUpgrade]] = await pool.execute(
+    'SELECT status FROM verification_upgrades WHERE user_id = ? ORDER BY id DESC LIMIT 1',
+    [req.userId]
+  );
+  const upgradeStatus =
+    u.verification_level === 'fully_verified'
+      ? 'none'
+      : latestUpgrade && (latestUpgrade.status === 'pending' || latestUpgrade.status === 'rejected')
+        ? latestUpgrade.status
+        : 'none';
+
   // Both spellings are returned on purpose. The app reads `walletId` (it is
   // what /api/login and the device-login route send), and the client's
   // refreshMe() replaces its whole user map with this response every 8 s, so a
   // snake_case-only payload silently empties the Wallet ID and the "My QR" code.
   // wallet_id stays for anything already reading it. Keep the two in sync.
-  res.json({ id: u.id, username: u.username, wallet_id: u.wallet_id, walletId: u.wallet_id, balance: toCentavos(u.balance) });
+  res.json({
+    id: u.id,
+    username: u.username,
+    wallet_id: u.wallet_id,
+    walletId: u.wallet_id,
+    balance: toCentavos(u.balance),
+    verification: {
+      level: u.verification_level,
+      livenessStatus: u.liveness_status,
+      upgradeStatus,
+    },
+  });
+}));
+
+// Post-login upgrade from 'verified' to 'fully_verified'. This never trusts
+// the client's liveness flag and never grants the level by itself: it only
+// creates a pending review row. An admin must approve it.
+app.post('/api/verification/upgrade', requireAuth, verificationUpgradeLimiter, asyncRoute(async (req, res) => {
+  const {
+    governmentIdPhotoFrontBase64,
+    governmentIdPhotoBackBase64,
+    selfiePhotoBase64,
+  } = req.body || {};
+
+  if (
+    !looksLikeImage(governmentIdPhotoFrontBase64) ||
+    !looksLikeImage(governmentIdPhotoBackBase64) ||
+    !looksLikeImage(selfiePhotoBase64)
+  ) {
+    return res.status(400).json({ error: 'The ID and selfie photos must be JPEG or PNG images under about 4 MB each' });
+  }
+  if (!governmentIdPhotoFrontBase64 || !governmentIdPhotoBackBase64 || !selfiePhotoBase64) {
+    return res.status(400).json({ error: 'Photos of the front and back of your ID, plus a live selfie, are required' });
+  }
+
+  // Accept the same flag shapes the clients use. A missing flag is a 400
+  // rather than an implicit 'passed'; the value is shown to the admin, not
+  // used to approve anything automatically.
+  let livenessStatus = null;
+  if (req.body?.livenessStatus === 'passed' || req.body?.livenessStatus === 'skipped') {
+    livenessStatus = req.body.livenessStatus;
+  } else if (typeof req.body?.livenessPassed === 'boolean') {
+    livenessStatus = req.body.livenessPassed ? 'passed' : 'skipped';
+  } else if (typeof req.body?.livenessSkipped === 'boolean') {
+    livenessStatus = req.body.livenessSkipped ? 'skipped' : 'passed';
+  } else if (typeof req.body?.liveness === 'boolean') {
+    livenessStatus = req.body.liveness ? 'passed' : 'skipped';
+  } else if (typeof req.body?.skipped === 'boolean') {
+    livenessStatus = req.body.skipped ? 'skipped' : 'passed';
+  } else if (req.body?.needsManualReview === true) {
+    livenessStatus = 'skipped';
+  }
+  if (!livenessStatus) {
+    return res.status(400).json({ error: 'livenessStatus must be passed or skipped' });
+  }
+
+  const [[user]] = await pool.execute(
+    'SELECT id, verification_level, verification_status FROM users WHERE id = ?',
+    [req.userId]
+  );
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (user.verification_status !== 'approved') {
+    return res.status(403).json({ error: 'Your account is not approved for verification upgrades' });
+  }
+  if (user.verification_level === 'fully_verified') {
+    return res.status(409).json({ error: 'Your account is already fully verified' });
+  }
+
+  const [[pending]] = await pool.execute(
+    "SELECT id FROM verification_upgrades WHERE user_id = ? AND status = 'pending' LIMIT 1",
+    [req.userId]
+  );
+  if (pending) {
+    return res.status(409).json({ error: 'You already have a verification upgrade waiting for review' });
+  }
+
+  // Face++ only produces a score for the admin. A Face++ outage must not lose
+  // the request; the review is manual in that case, exactly like registration.
+  let confidence = null;
+  try {
+    const result = await compareFaces(governmentIdPhotoFrontBase64, selfiePhotoBase64);
+    confidence = result.confidence;
+  } catch (err) {
+    console.error('Face comparison failed during verification upgrade:', err.message);
+  }
+
+  const encryptedFront = encryptPhoto(governmentIdPhotoFrontBase64);
+  const encryptedBack = encryptPhoto(governmentIdPhotoBackBase64);
+  const encryptedSelfie = encryptPhoto(selfiePhotoBase64);
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // Locking the user row serializes two simultaneous submissions from the
+    // same account, so both cannot pass the pending check and insert rows.
+    const [[lockedUser]] = await conn.query(
+      'SELECT id, verification_level, verification_status FROM users WHERE id = ? FOR UPDATE',
+      [req.userId]
+    );
+    if (!lockedUser) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'User not found' });
+    }
+    if (lockedUser.verification_status !== 'approved') {
+      await conn.rollback();
+      return res.status(403).json({ error: 'Your account is not approved for verification upgrades' });
+    }
+    if (lockedUser.verification_level === 'fully_verified') {
+      await conn.rollback();
+      return res.status(409).json({ error: 'Your account is already fully verified' });
+    }
+
+    const [[pendingLocked]] = await conn.query(
+      "SELECT id FROM verification_upgrades WHERE user_id = ? AND status = 'pending' LIMIT 1",
+      [req.userId]
+    );
+    if (pendingLocked) {
+      await conn.rollback();
+      return res.status(409).json({ error: 'You already have a verification upgrade waiting for review' });
+    }
+
+    const [result] = await conn.execute(
+      `INSERT INTO verification_upgrades
+         (user_id, status, liveness_status, face_match_confidence,
+          government_id_photo, government_id_photo_back, selfie_photo)
+       VALUES (?, 'pending', ?, ?, ?, ?, ?)`,
+      [
+        req.userId,
+        livenessStatus,
+        confidence,
+        encryptedFront,
+        encryptedBack,
+        encryptedSelfie,
+      ]
+    );
+
+    await conn.commit();
+    res.status(201).json({ ok: true, id: result.insertId, status: 'pending', livenessStatus });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 }));
 
 // ---------- wallet-to-wallet (QR) payment ----------
@@ -4393,6 +4583,117 @@ app.post('/api/admin/verifications/:id/respond', requireAdmin, asyncRoute(async 
   await refreshUserInIndex(userId);
   await logAdmin(req, approve ? 'approve_verification' : 'reject_verification', 'user', userId);
   res.json({ ok: true, status: approve ? 'approved' : 'rejected' });
+}));
+
+// Admin review for post-login upgrades. These are separate from the sign-up
+// review above: the account is already approved and can log in; only its
+// verification_level changes on approval.
+app.get('/api/admin/verification-upgrades/pending', requireAdmin, asyncRoute(async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT v.id, v.user_id AS userId, u.username, u.wallet_id AS walletId,
+            v.liveness_status AS livenessStatus,
+            v.face_match_confidence AS faceMatchConfidence,
+            v.government_id_photo AS governmentIdPhotoFront,
+            v.government_id_photo_back AS governmentIdPhotoBack,
+            v.selfie_photo AS selfiePhoto,
+            v.created_at AS createdAt
+       FROM verification_upgrades v
+       JOIN users u ON u.id = v.user_id
+      WHERE v.status = 'pending'
+      ORDER BY v.created_at ASC`
+  );
+  res.json(
+    rows.map((r) => ({
+      ...r,
+      governmentIdPhotoFront: decryptPhoto(r.governmentIdPhotoFront),
+      governmentIdPhotoBack: decryptPhoto(r.governmentIdPhotoBack),
+      selfiePhoto: decryptPhoto(r.selfiePhoto),
+    }))
+  );
+}));
+
+app.post('/api/admin/verification-upgrades/:id/respond', requireAdmin, asyncRoute(async (req, res) => {
+  const upgradeId = Number(req.params.id);
+  const approve = !!req.body?.approve;
+  if (!Number.isInteger(upgradeId)) return res.status(400).json({ error: 'Invalid upgrade ID' });
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [[upgrade]] = await conn.query(
+      'SELECT id, user_id, status, liveness_status FROM verification_upgrades WHERE id = ? FOR UPDATE',
+      [upgradeId]
+    );
+    if (!upgrade) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Verification upgrade not found' });
+    }
+    if (upgrade.status !== 'pending') {
+      await conn.rollback();
+      return res.status(409).json({ error: 'This upgrade has already been decided' });
+    }
+
+    const [[user]] = await conn.query(
+      'SELECT id, verification_level, verification_status FROM users WHERE id = ? FOR UPDATE',
+      [upgrade.user_id]
+    );
+    if (!user) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'The account for this upgrade no longer exists' });
+    }
+    if (approve && user.verification_status !== 'approved') {
+      await conn.rollback();
+      return res.status(409).json({ error: 'This account is not approved, so it cannot become fully verified' });
+    }
+    if (approve && user.verification_level === 'fully_verified') {
+      await conn.rollback();
+      return res.status(409).json({ error: 'This account is already fully verified' });
+    }
+
+    // The pending predicate is in the WHERE clause as well as the locked row,
+    // so two admins racing on the same request cannot both decide it.
+    const [decision] = await conn.execute(
+      "UPDATE verification_upgrades SET status = ?, reviewed_at = NOW(), reviewed_by = ? WHERE id = ? AND status = 'pending'",
+      [approve ? 'approved' : 'rejected', req.adminId, upgradeId]
+    );
+    if (decision.affectedRows === 0) {
+      await conn.rollback();
+      return res.status(409).json({ error: 'This upgrade has already been decided' });
+    }
+
+    if (approve) {
+      await conn.execute(
+        "UPDATE users SET verification_level = 'fully_verified', liveness_status = ? WHERE id = ?",
+        [upgrade.liveness_status, upgrade.user_id]
+      );
+    }
+
+    // Photos are only needed for this review. Delete them once decided, exactly
+    // like the sign-up review, unless the operator opted to keep them.
+    if (!KEEP_ID_PHOTOS) {
+      await conn.execute(
+        "UPDATE verification_upgrades SET government_id_photo = '', government_id_photo_back = '', selfie_photo = '' WHERE id = ?",
+        [upgradeId]
+      );
+    }
+
+    await conn.commit();
+    await refreshUserInIndex(upgrade.user_id);
+    await logAdmin(
+      req,
+      approve ? 'approve_verification_upgrade' : 'reject_verification_upgrade',
+      'verification_upgrade',
+      upgradeId,
+      { userId: upgrade.user_id }
+    );
+    res.json({ ok: true, status: approve ? 'approved' : 'rejected' });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 }));
 
 // ---------- admin: cash-in review ----------
