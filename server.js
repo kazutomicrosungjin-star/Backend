@@ -118,15 +118,28 @@ if (!corsOrigins) {
   console.warn('WARNING: CORS_ORIGIN is not set - any website origin is allowed. Set it in production.');
 }
 app.use(cors({ origin: corsOrigins || true }));
-// Default express.json() limit is 100kb, which is too small for the
-// base64-encoded ID front/back + selfie photos that /api/register sends —
-// that route was almost certainly failing with a 413 before this. 15mb
-// gives real photos room while still capping the body so a client can't
-// send an unbounded payload as a cheap DoS.
-// Large body (ID + selfie photos) only on registration and verification
-// upgrades; everything else 100kb.
+// Verification upgrades upload multiple photos and call Face++, so throttle
+// them per account like the login-adjacent routes (not by IP, since requireAuth
+// runs first). Defined before the body parser mount so the 35mb parser only
+// runs after auth and this limiter have accepted the request.
+const verificationUpgradeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => (req.userId ? `verification-upgrade:${req.userId}` : ipKeyGenerator(req)),
+  message: { error: 'Too many verification upgrade attempts. Please try again later.' },
+});
+
+// Default express.json() limit is 100kb, which is too small for base64 photos.
+// Registration's three photos keep their existing 15mb limit. Verification
+// upgrades are sized for the six-photo worst case (6 x 6,000,000 characters),
+// so 35mb (36,700,160 bytes) covers 36,000,000 bytes plus JSON overhead
+// without raising the limit on any other route.
 app.use('/api/register', express.json({ limit: '15mb' }));
-app.use('/api/verification/upgrade', express.json({ limit: '15mb' }));
+// Auth and throttling run before the large parser, so rejected requests never
+// parse a 35mb body. requireAuth is a hoisted function declaration.
+app.use('/api/verification/upgrade', requireAuth, verificationUpgradeLimiter, express.json({ limit: '35mb' }));
 app.use(express.json({ limit: '100kb' }));
 
 // Rate limiting on the endpoints most worth protecting against
@@ -572,18 +585,6 @@ const moneyLimiter = rateLimit({
   legacyHeaders: false,
   keyGenerator: (req) => (req.userId ? `u:${req.userId}` : ipKeyGenerator(req)),
   message: { error: 'Too many payments in a short time. Please wait a minute and try again.' },
-});
-
-// Verification upgrades upload three photos and call Face++, so throttle them
-// per account like the login-adjacent routes (not by IP, since requireAuth
-// runs first).
-const verificationUpgradeLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => (req.userId ? `verification-upgrade:${req.userId}` : ipKeyGenerator(req)),
-  message: { error: 'Too many verification upgrade attempts. Please try again later.' },
 });
 
 // Records what each admin did. Best effort: a logging problem never blocks the action.
@@ -1594,27 +1595,71 @@ app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
 // Post-login upgrade from 'verified' to 'fully_verified'. This never trusts
 // the client's liveness flag and never grants the level by itself: it only
 // creates a pending review row. An admin must approve it.
-app.post('/api/verification/upgrade', requireAuth, verificationUpgradeLimiter, asyncRoute(async (req, res) => {
+// requireAuth, the verification limiter and the 35mb parser are mounted above
+// this route (before the global 100kb parser) so rejected requests are never
+// parsed. They must not be repeated here or the limiter would count twice.
+app.post('/api/verification/upgrade', asyncRoute(async (req, res) => {
+  const requestedMethod = req.body?.upgradeMethod;
+  if (requestedMethod !== undefined && requestedMethod !== 'self' && requestedMethod !== 'guardian') {
+    return res.status(400).json({ error: "upgradeMethod must be 'self' or 'guardian'" });
+  }
+  // Existing clients send no upgradeMethod, so the self path stays the default.
+  const upgradeMethod = requestedMethod === 'guardian' ? 'guardian' : 'self';
+
   const {
     governmentIdPhotoFrontBase64,
     governmentIdPhotoBackBase64,
     selfiePhotoBase64,
+    guardianPhotoBase64,
+    guardianIdPhotoFrontBase64,
+    guardianIdPhotoBackBase64,
+    birthCertificatePhotoBase64,
+    guardianName: rawGuardianName,
+    guardianRelationship,
+    consent,
   } = req.body || {};
 
-  if (
-    !looksLikeImage(governmentIdPhotoFrontBase64) ||
-    !looksLikeImage(governmentIdPhotoBackBase64) ||
-    !looksLikeImage(selfiePhotoBase64)
-  ) {
-    return res.status(400).json({ error: 'The ID and selfie photos must be JPEG or PNG images under about 4 MB each' });
-  }
-  if (!governmentIdPhotoFrontBase64 || !governmentIdPhotoBackBase64 || !selfiePhotoBase64) {
-    return res.status(400).json({ error: 'Photos of the front and back of your ID, plus a live selfie, are required' });
+  let guardianName = null;
+  if (upgradeMethod === 'guardian') {
+    if (
+      !looksLikeImage(selfiePhotoBase64) ||
+      !looksLikeImage(guardianPhotoBase64) ||
+      !looksLikeImage(guardianIdPhotoFrontBase64) ||
+      !looksLikeImage(guardianIdPhotoBackBase64) ||
+      !looksLikeImage(birthCertificatePhotoBase64)
+    ) {
+      return res.status(400).json({ error: 'Guardian verification requires the account holder selfie, guardian live photo, front and back of the guardian ID, and a birth certificate photo as JPEG or PNG images under about 4 MB each' });
+    }
+    if (typeof rawGuardianName !== 'string') {
+      return res.status(400).json({ error: 'guardianName must be 2-100 characters' });
+    }
+    guardianName = cleanText(rawGuardianName, 100);
+    if (guardianName.length < 2) {
+      return res.status(400).json({ error: 'guardianName must be 2-100 characters' });
+    }
+    if (guardianRelationship !== 'parent' && guardianRelationship !== 'legal_guardian') {
+      return res.status(400).json({ error: "guardianRelationship must be 'parent' or 'legal_guardian'" });
+    }
+    if (consent !== true) {
+      return res.status(400).json({ error: 'Guardian consent is required' });
+    }
+  } else {
+    if (
+      !looksLikeImage(governmentIdPhotoFrontBase64) ||
+      !looksLikeImage(governmentIdPhotoBackBase64) ||
+      !looksLikeImage(selfiePhotoBase64)
+    ) {
+      return res.status(400).json({ error: 'The ID and selfie photos must be JPEG or PNG images under about 4 MB each' });
+    }
+    if (!governmentIdPhotoFrontBase64 || !governmentIdPhotoBackBase64 || !selfiePhotoBase64) {
+      return res.status(400).json({ error: 'Photos of the front and back of your ID, plus a live selfie, are required' });
+    }
   }
 
-  // Accept the same flag shapes the clients use. A missing flag is a 400
-  // rather than an implicit 'passed'; the value is shown to the admin, not
-  // used to approve anything automatically.
+  // Accept the same flag shapes the clients use. A missing flag is a 400 for
+  // the self path rather than an implicit 'passed'; the value is shown to the
+  // admin, not used to approve anything automatically. Guardian submissions
+  // default to 'skipped' because their live photo is reviewed manually.
   let livenessStatus = null;
   if (req.body?.livenessStatus === 'passed' || req.body?.livenessStatus === 'skipped') {
     livenessStatus = req.body.livenessStatus;
@@ -1629,8 +1674,11 @@ app.post('/api/verification/upgrade', requireAuth, verificationUpgradeLimiter, a
   } else if (req.body?.needsManualReview === true) {
     livenessStatus = 'skipped';
   }
-  if (!livenessStatus) {
+  if (upgradeMethod === 'self' && !livenessStatus) {
     return res.status(400).json({ error: 'livenessStatus must be passed or skipped' });
+  }
+  if (upgradeMethod === 'guardian' && !livenessStatus) {
+    livenessStatus = 'skipped';
   }
 
   const [[user]] = await pool.execute(
@@ -1655,17 +1703,44 @@ app.post('/api/verification/upgrade', requireAuth, verificationUpgradeLimiter, a
 
   // Face++ only produces a score for the admin. A Face++ outage must not lose
   // the request; the review is manual in that case, exactly like registration.
+  // The guardian path compares the guardian ID front with the guardian live
+  // photo; the birth certificate is deliberately not sent to Face++.
   let confidence = null;
-  try {
-    const result = await compareFaces(governmentIdPhotoFrontBase64, selfiePhotoBase64);
-    confidence = result.confidence;
-  } catch (err) {
-    console.error('Face comparison failed during verification upgrade:', err.message);
+  let guardianFaceConfidence = null;
+  if (upgradeMethod === 'guardian') {
+    try {
+      const result = await compareFaces(guardianIdPhotoFrontBase64, guardianPhotoBase64);
+      guardianFaceConfidence = result.confidence;
+    } catch (err) {
+      console.error('Face comparison failed during guardian verification upgrade:', err.message);
+    }
+  } else {
+    try {
+      const result = await compareFaces(governmentIdPhotoFrontBase64, selfiePhotoBase64);
+      confidence = result.confidence;
+    } catch (err) {
+      console.error('Face comparison failed during verification upgrade:', err.message);
+    }
   }
 
-  const encryptedFront = encryptPhoto(governmentIdPhotoFrontBase64);
-  const encryptedBack = encryptPhoto(governmentIdPhotoBackBase64);
-  const encryptedSelfie = encryptPhoto(selfiePhotoBase64);
+  let encryptedFront = null;
+  let encryptedBack = null;
+  let encryptedSelfie = null;
+  let encryptedGuardianPhoto = null;
+  let encryptedGuardianIdFront = null;
+  let encryptedGuardianIdBack = null;
+  let encryptedBirthCertificate = null;
+  if (upgradeMethod === 'guardian') {
+    encryptedSelfie = encryptPhoto(selfiePhotoBase64);
+    encryptedGuardianPhoto = encryptPhoto(guardianPhotoBase64);
+    encryptedGuardianIdFront = encryptPhoto(guardianIdPhotoFrontBase64);
+    encryptedGuardianIdBack = encryptPhoto(guardianIdPhotoBackBase64);
+    encryptedBirthCertificate = encryptPhoto(birthCertificatePhotoBase64);
+  } else {
+    encryptedFront = encryptPhoto(governmentIdPhotoFrontBase64);
+    encryptedBack = encryptPhoto(governmentIdPhotoBackBase64);
+    encryptedSelfie = encryptPhoto(selfiePhotoBase64);
+  }
 
   const conn = await pool.getConnection();
   try {
@@ -1699,20 +1774,44 @@ app.post('/api/verification/upgrade', requireAuth, verificationUpgradeLimiter, a
       return res.status(409).json({ error: 'You already have a verification upgrade waiting for review' });
     }
 
-    const [result] = await conn.execute(
-      `INSERT INTO verification_upgrades
-         (user_id, status, liveness_status, face_match_confidence,
-          government_id_photo, government_id_photo_back, selfie_photo)
-       VALUES (?, 'pending', ?, ?, ?, ?, ?)`,
-      [
-        req.userId,
-        livenessStatus,
-        confidence,
-        encryptedFront,
-        encryptedBack,
-        encryptedSelfie,
-      ]
-    );
+    let result;
+    if (upgradeMethod === 'guardian') {
+      [result] = await conn.execute(
+        `INSERT INTO verification_upgrades
+           (user_id, status, liveness_status, upgrade_method, guardian_name,
+            guardian_relationship, selfie_photo, guardian_photo,
+            guardian_id_photo, guardian_id_photo_back, birth_certificate_photo,
+            guardian_face_match_confidence, consent_at)
+         VALUES (?, 'pending', ?, 'guardian', ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+        [
+          req.userId,
+          livenessStatus,
+          guardianName,
+          guardianRelationship,
+          encryptedSelfie,
+          encryptedGuardianPhoto,
+          encryptedGuardianIdFront,
+          encryptedGuardianIdBack,
+          encryptedBirthCertificate,
+          guardianFaceConfidence,
+        ]
+      );
+    } else {
+      [result] = await conn.execute(
+        `INSERT INTO verification_upgrades
+           (user_id, status, liveness_status, face_match_confidence,
+            government_id_photo, government_id_photo_back, selfie_photo)
+         VALUES (?, 'pending', ?, ?, ?, ?, ?)`,
+        [
+          req.userId,
+          livenessStatus,
+          confidence,
+          encryptedFront,
+          encryptedBack,
+          encryptedSelfie,
+        ]
+      );
+    }
 
     await conn.commit();
     res.status(201).json({ ok: true, id: result.insertId, status: 'pending', livenessStatus });
@@ -4656,16 +4755,25 @@ app.post('/api/admin/verifications/:id/respond', requireAdmin, asyncRoute(async 
 app.get('/api/admin/verification-upgrades/pending', requireAdmin, asyncRoute(async (req, res) => {
   const [rows] = await pool.query(
     `SELECT v.id, v.user_id AS userId, u.username, u.wallet_id AS walletId,
+            v.upgrade_method AS upgradeMethod,
             v.liveness_status AS livenessStatus,
             v.face_match_confidence AS faceMatchConfidence,
+            v.guardian_name AS guardianName,
+            v.guardian_relationship AS guardianRelationship,
+            v.guardian_face_match_confidence AS guardianFaceMatchConfidence,
             v.government_id_photo AS governmentIdPhotoFront,
             v.government_id_photo_back AS governmentIdPhotoBack,
             v.selfie_photo AS selfiePhoto,
+            v.guardian_photo AS guardianPhoto,
+            v.guardian_id_photo AS guardianIdPhotoFront,
+            v.guardian_id_photo_back AS guardianIdPhotoBack,
+            v.birth_certificate_photo AS birthCertificatePhoto,
             v.created_at AS createdAt
        FROM verification_upgrades v
        JOIN users u ON u.id = v.user_id
       WHERE v.status = 'pending'
-      ORDER BY v.created_at ASC`
+      ORDER BY v.created_at ASC
+      LIMIT 5`
   );
   res.json(
     rows.map((r) => ({
@@ -4673,6 +4781,10 @@ app.get('/api/admin/verification-upgrades/pending', requireAdmin, asyncRoute(asy
       governmentIdPhotoFront: decryptPhoto(r.governmentIdPhotoFront),
       governmentIdPhotoBack: decryptPhoto(r.governmentIdPhotoBack),
       selfiePhoto: decryptPhoto(r.selfiePhoto),
+      guardianPhoto: decryptPhoto(r.guardianPhoto),
+      guardianIdPhotoFront: decryptPhoto(r.guardianIdPhotoFront),
+      guardianIdPhotoBack: decryptPhoto(r.guardianIdPhotoBack),
+      birthCertificatePhoto: decryptPhoto(r.birthCertificatePhoto),
     }))
   );
 }));
@@ -4687,7 +4799,7 @@ app.post('/api/admin/verification-upgrades/:id/respond', requireAdmin, asyncRout
     await conn.beginTransaction();
 
     const [[upgrade]] = await conn.query(
-      'SELECT id, user_id, status, liveness_status FROM verification_upgrades WHERE id = ? FOR UPDATE',
+      'SELECT id, user_id, status, liveness_status, upgrade_method FROM verification_upgrades WHERE id = ? FOR UPDATE',
       [upgradeId]
     );
     if (!upgrade) {
@@ -4738,7 +4850,7 @@ app.post('/api/admin/verification-upgrades/:id/respond', requireAdmin, asyncRout
     // like the sign-up review, unless the operator opted to keep them.
     if (!KEEP_ID_PHOTOS) {
       await conn.execute(
-        "UPDATE verification_upgrades SET government_id_photo = '', government_id_photo_back = '', selfie_photo = '' WHERE id = ?",
+        "UPDATE verification_upgrades SET government_id_photo = '', government_id_photo_back = '', selfie_photo = '', guardian_photo = '', guardian_id_photo = '', guardian_id_photo_back = '', birth_certificate_photo = '' WHERE id = ?",
         [upgradeId]
       );
     }
@@ -4750,7 +4862,7 @@ app.post('/api/admin/verification-upgrades/:id/respond', requireAdmin, asyncRout
       approve ? 'approve_verification_upgrade' : 'reject_verification_upgrade',
       'verification_upgrade',
       upgradeId,
-      { userId: upgrade.user_id }
+      { userId: upgrade.user_id, upgradeMethod: upgrade.upgrade_method }
     );
     res.json({ ok: true, status: approve ? 'approved' : 'rejected' });
   } catch (err) {
