@@ -1797,9 +1797,9 @@ app.post('/api/wallet/pay', requireAuth, moneyLimiter, idempotent, requirePin, a
     // username is loaded here so the receiver's row can name the sender
     // instead of printing their numeric user id. Same row, same read - no
     // extra query, and the label below is the only thing that uses it.
-    const [[sender]] = await conn.query('SELECT id, username, balance FROM users WHERE id = ?', [req.userId]);
+    const [[sender]] = await conn.query('SELECT id, username, balance, verification_level FROM users WHERE id = ?', [req.userId]);
     const [[recipient]] = found
-      ? await conn.query('SELECT id, username, balance FROM users WHERE id = ?', [found.id])
+      ? await conn.query('SELECT id, username, balance, verification_level FROM users WHERE id = ?', [found.id])
       : [[undefined]];
 
     if (!recipient) {
@@ -1817,7 +1817,9 @@ app.post('/api/wallet/pay', requireAuth, moneyLimiter, idempotent, requirePin, a
       return res.status(400).json({ error: 'Insufficient balance' });
     }
 
-    const limitError = (await outgoingLimitError(conn, sender.id, amt)) || recipientCapError(toCentavos(recipient.balance), amt);
+    const senderLimits = limitsForUser(sender.verification_level);
+    const recipientLimits = limitsForUser(recipient.verification_level);
+    const limitError = (await outgoingLimitError(conn, sender.id, amt, senderLimits)) || recipientCapError(toCentavos(recipient.balance), amt, recipientLimits);
     if (limitError) {
       await conn.rollback();
       return res.status(400).json({ error: limitError });
@@ -1959,14 +1961,16 @@ app.post('/api/requests/:id/pay', requireAuth, moneyLimiter, idempotent, require
     const amt = toCentavos(request.amount);
     const lockIds = [request.payer_id, request.requester_id].sort((a, b) => a - b);
     await conn.query(`SELECT id FROM users WHERE id IN (?, ?) ORDER BY id FOR UPDATE`, lockIds);
-    const [[payer]] = await conn.query('SELECT id, username, balance FROM users WHERE id = ?', [request.payer_id]);
-    const [[requester]] = await conn.query('SELECT id, username, balance FROM users WHERE id = ?', [request.requester_id]);
+    const [[payer]] = await conn.query('SELECT id, username, balance, verification_level FROM users WHERE id = ?', [request.payer_id]);
+    const [[requester]] = await conn.query('SELECT id, username, balance, verification_level FROM users WHERE id = ?', [request.requester_id]);
 
     if (toCentavos(payer.balance) < amt) {
       await conn.rollback();
       return res.status(400).json({ error: 'Insufficient balance' });
     }
-    const limitError = (await outgoingLimitError(conn, payer.id, amt)) || recipientCapError(toCentavos(requester.balance), amt);
+    const payerLimits = limitsForUser(payer.verification_level);
+    const requesterLimits = limitsForUser(requester.verification_level);
+    const limitError = (await outgoingLimitError(conn, payer.id, amt, payerLimits)) || recipientCapError(toCentavos(requester.balance), amt, requesterLimits);
     if (limitError) {
       await conn.rollback();
       return res.status(400).json({ error: limitError });
@@ -2481,9 +2485,9 @@ app.post('/api/send', requireAuth, moneyLimiter, idempotent, requirePin, asyncRo
     // username is loaded here so the receiver's row can name the sender
     // instead of printing their numeric user id. Same row, same read - no
     // extra query, and the label below is the only thing that uses it.
-    const [[sender]] = await conn.query('SELECT id, username, balance FROM users WHERE id = ?', [req.userId]);
+    const [[sender]] = await conn.query('SELECT id, username, balance, verification_level FROM users WHERE id = ?', [req.userId]);
     const [[recipientUser]] = found
-      ? await conn.query('SELECT id, username, balance FROM users WHERE id = ?', [found.id])
+      ? await conn.query('SELECT id, username, balance, verification_level FROM users WHERE id = ?', [found.id])
       : [[undefined]];
 
     // ---- unchanged ----
@@ -2503,7 +2507,9 @@ app.post('/api/send', requireAuth, moneyLimiter, idempotent, requirePin, asyncRo
     }
     // ---- end unchanged ----
 
-    const limitError = (await outgoingLimitError(conn, sender.id, amt)) || recipientCapError(toCentavos(recipientUser.balance), amt);
+    const senderLimits = limitsForUser(sender.verification_level);
+    const recipientLimits = limitsForUser(recipientUser.verification_level);
+    const limitError = (await outgoingLimitError(conn, sender.id, amt, senderLimits)) || recipientCapError(toCentavos(recipientUser.balance), amt, recipientLimits);
     if (limitError) {
       await conn.rollback();
       return res.status(400).json({ error: limitError });
