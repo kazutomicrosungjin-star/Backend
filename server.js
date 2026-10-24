@@ -353,7 +353,7 @@ function fullyVerifiedLimitCentavos(envName, fallbackCentavos) {
   const raw = process.env[envName];
   if (raw === undefined || String(raw).trim() === '') return fallbackCentavos;
   const value = Number(raw);
-  return Number.isFinite(value) ? value * 100 : fallbackCentavos;
+  return Number.isFinite(value) && value > 0 ? value * 100 : fallbackCentavos;
 }
 
 const fullyVerifiedConfigured = Object.values(FULLY_VERIFIED_LIMIT_ENV).every(
@@ -1907,8 +1907,9 @@ app.post('/api/requests', requireAuth, moneyLimiter, asyncRoute(async (req, res)
   if (!walletId || amt === null) {
     return res.status(400).json({ error: 'Enter who to ask and an amount' });
   }
-  if (amt > LIMITS.perTransactionCentavos) {
-    return res.status(400).json({ error: `You can request at most ${pesoText(LIMITS.perTransactionCentavos)} at a time` });
+  const limits = limitsForUser(req.verificationLevel);
+  if (amt > limits.perTransactionCentavos) {
+    return res.status(400).json({ error: `You can request at most ${pesoText(limits.perTransactionCentavos)} at a time` });
   }
   const [[payer]] = await pool.query("SELECT id, username, status FROM users WHERE wallet_id = ? OR phone_number = ?", [walletId, walletId]);
   if (!payer || payer.status !== 'active') return res.status(404).json({ error: 'No account found for that number' });
@@ -2039,8 +2040,9 @@ app.post('/api/requests/split', requireAuth, moneyLimiter, idempotent, asyncRout
   if (total === null) {
     return res.status(400).json({ error: 'A positive total (integer centavos) is required' });
   }
-  if (total > LIMITS.perTransactionCentavos) {
-    return res.status(400).json({ error: `You can split at most ${pesoText(LIMITS.perTransactionCentavos)} at a time` });
+  const limits = limitsForUser(req.verificationLevel);
+  if (total > limits.perTransactionCentavos) {
+    return res.status(400).json({ error: `You can split at most ${pesoText(limits.perTransactionCentavos)} at a time` });
   }
 
   const raw = req.body?.participants;
@@ -2246,8 +2248,9 @@ app.post('/api/cashin', requireAuth, moneyLimiter, asyncRoute(async (req, res) =
   const amt = parseCentavos(req.body?.amountCentavos);
   if (!CASH_IN_CHANNELS[channel]) return res.status(400).json({ error: 'Choose how you want to cash in' });
   if (amt === null || amt < CASH_IN_MIN) return res.status(400).json({ error: `The minimum cash in is ${pesoText(CASH_IN_MIN)}` });
-  if (amt > LIMITS.perTransactionCentavos) {
-    return res.status(400).json({ error: `The most you can cash in at once is ${pesoText(LIMITS.perTransactionCentavos)}` });
+  const limits = limitsForUser(req.verificationLevel);
+  if (amt > limits.perTransactionCentavos) {
+    return res.status(400).json({ error: `The most you can cash in at once is ${pesoText(limits.perTransactionCentavos)}` });
   }
   const [[open]] = await pool.query(
     "SELECT COUNT(*) AS n FROM cash_ins WHERE user_id = ? AND status = 'pending' AND expires_at > NOW()",
@@ -2290,11 +2293,12 @@ app.post('/api/cashin/:id/simulate-paid', requireAuth, moneyLimiter, asyncRoute(
       await conn.rollback();
       return res.status(400).json({ error: 'This cash-in request has expired. Please start a new one.' });
     }
-    const [[user]] = await conn.query('SELECT id, balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    const [[user]] = await conn.query('SELECT id, balance, verification_level FROM users WHERE id = ? FOR UPDATE', [req.userId]);
     const amt = toCentavos(row.amount);
-    if (toCentavos(user.balance) + amt > LIMITS.maxBalanceCentavos) {
+    const limits = limitsForUser(user.verification_level);
+    if (toCentavos(user.balance) + amt > limits.maxBalanceCentavos) {
       await conn.rollback();
-      return res.status(400).json({ error: `Your wallet can hold at most ${pesoText(LIMITS.maxBalanceCentavos)}.` });
+      return res.status(400).json({ error: `Your wallet can hold at most ${pesoText(limits.maxBalanceCentavos)}.` });
     }
     await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, req.userId]);
     await conn.execute(
@@ -2560,14 +2564,14 @@ app.post('/api/load', requireAuth, moneyLimiter, idempotent, requirePin, asyncRo
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    const [[user]] = await conn.query('SELECT id, balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    const [[user]] = await conn.query('SELECT id, balance, verification_level FROM users WHERE id = ? FOR UPDATE', [req.userId]);
     const userBalance = toCentavos(user.balance);
     if (userBalance < amt) {
       await conn.rollback();
       return res.status(400).json({ error: 'Insufficient balance' });
     }
 
-    const limitError = await outgoingLimitError(conn, req.userId, amt);
+    const limitError = await outgoingLimitError(conn, req.userId, amt, limitsForUser(user.verification_level));
     if (limitError) {
       await conn.rollback();
       return res.status(400).json({ error: limitError });
@@ -2607,14 +2611,14 @@ app.post('/api/bills/pay', requireAuth, moneyLimiter, idempotent, requirePin, as
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    const [[user]] = await conn.query('SELECT id, balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    const [[user]] = await conn.query('SELECT id, balance, verification_level FROM users WHERE id = ? FOR UPDATE', [req.userId]);
     const userBalance = toCentavos(user.balance);
     if (userBalance < amt) {
       await conn.rollback();
       return res.status(400).json({ error: 'Insufficient balance' });
     }
 
-    const limitError = await outgoingLimitError(conn, req.userId, amt);
+    const limitError = await outgoingLimitError(conn, req.userId, amt, limitsForUser(user.verification_level));
     if (limitError) {
       await conn.rollback();
       return res.status(400).json({ error: limitError });
@@ -3168,8 +3172,8 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, m
         return res.status(400).json({ error: 'Group balance too low to complete this withdrawal now' });
       }
 
-      const [[requester]] = await conn.query('SELECT username, balance FROM users WHERE id = ? FOR UPDATE', [request.requester_id]);
-      const capError = recipientCapError(toCentavos(requester.balance), amt);
+      const [[requester]] = await conn.query('SELECT username, balance, verification_level FROM users WHERE id = ? FOR UPDATE', [request.requester_id]);
+      const capError = recipientCapError(toCentavos(requester.balance), amt, limitsForUser(requester.verification_level));
       if (capError) {
         await conn.rollback();
         // Say whose wallet is full without naming them or exposing their balance.
@@ -3222,12 +3226,12 @@ app.post('/api/groups/:id/contribute', requireAuth, moneyLimiter, idempotent, re
     // username is loaded here so the group-side row below can name the
     // contributor instead of printing their numeric user id. Same row, same
     // read - no extra query and no change to the lock order.
-    const [[user]] = await conn.query('SELECT username, balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    const [[user]] = await conn.query('SELECT username, balance, verification_level FROM users WHERE id = ? FOR UPDATE', [req.userId]);
     if (toCentavos(user.balance) < amt) {
       await conn.rollback();
       return res.status(400).json({ error: 'Insufficient balance' });
     }
-    const limitError = await outgoingLimitError(conn, req.userId, amt);
+    const limitError = await outgoingLimitError(conn, req.userId, amt, limitsForUser(user.verification_level));
     if (limitError) {
       await conn.rollback();
       return res.status(400).json({ error: limitError });
@@ -3331,13 +3335,13 @@ app.post('/api/savings/:id/deposit', requireAuth, moneyLimiter, idempotent, requ
       await conn.rollback();
       return res.status(404).json({ error: 'Goal not found' });
     }
-    const [[user]] = await conn.query('SELECT balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    const [[user]] = await conn.query('SELECT balance, verification_level FROM users WHERE id = ? FOR UPDATE', [req.userId]);
     if (toCentavos(user.balance) < amt) {
       await conn.rollback();
       return res.status(400).json({ error: 'Insufficient balance' });
     }
 
-    const limitError = await outgoingLimitError(conn, req.userId, amt);
+    const limitError = await outgoingLimitError(conn, req.userId, amt, limitsForUser(user.verification_level));
     if (limitError) {
       await conn.rollback();
       return res.status(400).json({ error: limitError });
@@ -3388,11 +3392,12 @@ app.post('/api/savings/:id/withdraw', requireAuth, moneyLimiter, idempotent, req
       return res.status(400).json({ error: 'Not enough saved in this goal' });
     }
 
-    const [[user]] = await conn.query('SELECT balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
-    const capError = recipientCapError(toCentavos(user.balance), amt);
+    const [[user]] = await conn.query('SELECT balance, verification_level FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    const recipientLimits = limitsForUser(user.verification_level);
+    const capError = recipientCapError(toCentavos(user.balance), amt, recipientLimits);
     if (capError) {
       await conn.rollback();
-      return res.status(400).json({ error: `Your wallet can hold at most ${pesoText(LIMITS.maxBalanceCentavos)}. Spend or send some money first, then try again. Your savings are still safe in this goal.` });
+      return res.status(400).json({ error: `Your wallet can hold at most ${pesoText(recipientLimits.maxBalanceCentavos)}. Spend or send some money first, then try again. Your savings are still safe in this goal.` });
     }
 
     const newSaved = saved - amt;
@@ -3431,11 +3436,12 @@ app.delete('/api/savings/:id', requireAuth, moneyLimiter, idempotent, requirePin
     }
     const saved = toCentavos(goal.saved_amount);
     if (saved > 0) {
-      const [[user]] = await conn.query('SELECT balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
-      const capError = recipientCapError(toCentavos(user.balance), saved);
+      const [[user]] = await conn.query('SELECT balance, verification_level FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+      const recipientLimits = limitsForUser(user.verification_level);
+      const capError = recipientCapError(toCentavos(user.balance), saved, recipientLimits);
       if (capError) {
         await conn.rollback();
-        return res.status(400).json({ error: `Your wallet can hold at most ${pesoText(LIMITS.maxBalanceCentavos)}. Spend or send some money first, then try again. Your savings are still safe and this goal was not closed.` });
+        return res.status(400).json({ error: `Your wallet can hold at most ${pesoText(recipientLimits.maxBalanceCentavos)}. Spend or send some money first, then try again. Your savings are still safe and this goal was not closed.` });
       }
       await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [saved, req.userId]);
       await conn.execute(
@@ -3516,7 +3522,7 @@ app.post('/api/events/:id/tickets', requireAuth, moneyLimiter, idempotent, requi
   try {
     await conn.beginTransaction();
 
-    const [[user]] = await conn.query('SELECT id, balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    const [[user]] = await conn.query('SELECT id, balance, verification_level FROM users WHERE id = ? FOR UPDATE', [req.userId]);
     if (!user) {
       await conn.rollback();
       return res.status(401).json({ error: 'Not authenticated' });
@@ -3552,7 +3558,7 @@ app.post('/api/events/:id/tickets', requireAuth, moneyLimiter, idempotent, requi
       await conn.rollback();
       return res.status(400).json({ error: 'Insufficient balance' });
     }
-    const limitError = await outgoingLimitError(conn, req.userId, amount);
+    const limitError = await outgoingLimitError(conn, req.userId, amount, limitsForUser(user.verification_level));
     if (limitError) {
       await conn.rollback();
       return res.status(400).json({ error: limitError });
@@ -4331,7 +4337,7 @@ app.post('/api/loans/:id/repay', requireAuth, moneyLimiter, idempotent, requireP
       return res.status(400).json({ error: 'This loan is not active' });
     }
 
-    const [[user]] = await conn.query('SELECT balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    const [[user]] = await conn.query('SELECT balance, verification_level FROM users WHERE id = ? FOR UPDATE', [req.userId]);
     if (toCentavos(user.balance) < amt) {
       await conn.rollback();
       return res.status(400).json({ error: 'Insufficient balance' });
@@ -4341,7 +4347,7 @@ app.post('/api/loans/:id/repay', requireAuth, moneyLimiter, idempotent, requireP
     const loanRepaid = toCentavos(loan.amount_repaid);
     const remaining = loanAmount - loanRepaid;
     const applied = Math.min(amt, remaining);
-    const limitError = await outgoingLimitError(conn, req.userId, applied);
+    const limitError = await outgoingLimitError(conn, req.userId, applied, limitsForUser(user.verification_level));
     if (limitError) {
       await conn.rollback();
       return res.status(400).json({ error: limitError });
@@ -4826,15 +4832,16 @@ app.post('/api/admin/cashins/:id/respond', requireAdmin, asyncRoute(async (req, 
       return res.json({ ok: true, status: 'rejected' });
     }
 
-    const [[user]] = await conn.query('SELECT id, balance FROM users WHERE id = ? FOR UPDATE', [row.user_id]);
+    const [[user]] = await conn.query('SELECT id, balance, verification_level FROM users WHERE id = ? FOR UPDATE', [row.user_id]);
     if (!user) {
       await conn.rollback();
       return res.status(404).json({ error: 'The account for this cash-in no longer exists' });
     }
     const amt = toCentavos(row.amount);
-    if (toCentavos(user.balance) + amt > LIMITS.maxBalanceCentavos) {
+    const limits = limitsForUser(user.verification_level);
+    if (toCentavos(user.balance) + amt > limits.maxBalanceCentavos) {
       await conn.rollback();
-      return res.status(400).json({ error: `Your wallet can hold at most ${pesoText(LIMITS.maxBalanceCentavos)}.` });
+      return res.status(400).json({ error: `Your wallet can hold at most ${pesoText(limits.maxBalanceCentavos)}.` });
     }
 
     await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, row.user_id]);
