@@ -342,6 +342,52 @@ const LIMITS = {
   dailyCentavos: Number(process.env.LIMIT_DAILY_PESOS || 100000) * 100,
   maxBalanceCentavos: Number(process.env.LIMIT_MAX_BALANCE_PESOS || 500000) * 100,
 };
+
+const FULLY_VERIFIED_LIMIT_ENV = {
+  perTransactionCentavos: 'FULLY_VERIFIED_LIMIT_PER_TRANSACTION_PESOS',
+  dailyCentavos: 'FULLY_VERIFIED_LIMIT_DAILY_PESOS',
+  maxBalanceCentavos: 'FULLY_VERIFIED_LIMIT_MAX_BALANCE_PESOS',
+};
+
+function fullyVerifiedLimitCentavos(envName, fallbackCentavos) {
+  const raw = process.env[envName];
+  if (raw === undefined || String(raw).trim() === '') return fallbackCentavos;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value * 100 : fallbackCentavos;
+}
+
+const fullyVerifiedConfigured = Object.values(FULLY_VERIFIED_LIMIT_ENV).every(
+  (envName) => process.env[envName] !== undefined && String(process.env[envName]).trim() !== ''
+);
+
+const FULLY_VERIFIED_LIMITS = {
+  perTransactionCentavos: fullyVerifiedLimitCentavos(
+    FULLY_VERIFIED_LIMIT_ENV.perTransactionCentavos,
+    LIMITS.perTransactionCentavos
+  ),
+  dailyCentavos: fullyVerifiedLimitCentavos(
+    FULLY_VERIFIED_LIMIT_ENV.dailyCentavos,
+    LIMITS.dailyCentavos
+  ),
+  maxBalanceCentavos: fullyVerifiedLimitCentavos(
+    FULLY_VERIFIED_LIMIT_ENV.maxBalanceCentavos,
+    LIMITS.maxBalanceCentavos
+  ),
+};
+
+if (!fullyVerifiedConfigured) {
+  console.warn('[limits] FULLY_VERIFIED_LIMIT_* is not fully configured; using verified limits for missing values.');
+}
+
+const LIMITS_BY_LEVEL = {
+  verified: LIMITS,
+  fully_verified: FULLY_VERIFIED_LIMITS,
+};
+
+function limitsForUser(level) {
+  return level === 'fully_verified' ? LIMITS_BY_LEVEL.fully_verified : LIMITS_BY_LEVEL.verified;
+}
+
 // Money going out of the wallet counts toward the daily limit (store, food and games are bill payments).
 const SPENDING_TYPES = ['Send Money', 'Load', 'Bill Payment', 'QR Payment', 'Loan Repayment', 'Event Ticket'];
 
@@ -361,20 +407,20 @@ async function spentInLast24h(conn, userId) {
 }
 
 // Error message if this payment would break a limit, otherwise null.
-async function outgoingLimitError(conn, userId, amt) {
-  if (amt > LIMITS.perTransactionCentavos) {
-    return `The most you can send in one transaction is ${pesoText(LIMITS.perTransactionCentavos)}.`;
+async function outgoingLimitError(conn, userId, amt, limits = LIMITS) {
+  if (amt > limits.perTransactionCentavos) {
+    return `The most you can send in one transaction is ${pesoText(limits.perTransactionCentavos)}.`;
   }
   const used = await spentInLast24h(conn, userId);
-  if (used + amt > LIMITS.dailyCentavos) {
-    const left = Math.max(0, LIMITS.dailyCentavos - used);
-    return `This would pass your daily limit of ${pesoText(LIMITS.dailyCentavos)}. You can still spend ${pesoText(left)} in the next 24 hours.`;
+  if (used + amt > limits.dailyCentavos) {
+    const left = Math.max(0, limits.dailyCentavos - used);
+    return `This would pass your daily limit of ${pesoText(limits.dailyCentavos)}. You can still spend ${pesoText(left)} in the next 24 hours.`;
   }
   return null;
 }
 
-function recipientCapError(balanceCentavos, amt) {
-  return balanceCentavos + amt > LIMITS.maxBalanceCentavos ? "That wallet can't receive this amount because it would pass the maximum balance." : null;
+function recipientCapError(balanceCentavos, amt, limits = LIMITS) {
+  return balanceCentavos + amt > limits.maxBalanceCentavos ? "That wallet can't receive this amount because it would pass the maximum balance." : null;
 }
 
 // ---------- double-charge protection ----------
@@ -497,7 +543,10 @@ async function requireAuth(req, res, next) {
     }
     // Suspension must take effect immediately, not only at the next login -
     // a 2h token issued before suspension would otherwise keep working.
-    const [[row]] = await pool.query('SELECT status, session_version FROM users WHERE id = ?', [payload.uid]);
+    const [[row]] = await pool.query(
+      'SELECT status, session_version, verification_level FROM users WHERE id = ?',
+      [payload.uid]
+    );
     if (!row) return res.status(401).json({ error: 'Not authenticated' });
     if (row.status === 'suspended') {
       return res.status(403).json({ error: 'This account has been suspended. Contact support for assistance.' });
@@ -506,6 +555,7 @@ async function requireAuth(req, res, next) {
       return res.status(401).json({ error: 'Not authenticated' });
     }
     req.userId = payload.uid;
+    req.verificationLevel = row.verification_level;
     next();
   } catch (err) {
     next(err);
@@ -2133,13 +2183,16 @@ app.post('/api/requests/split', requireAuth, moneyLimiter, idempotent, asyncRout
 
 // ---------- account limits (shown in the app) ----------
 app.get('/api/limits', requireAuth, asyncRoute(async (req, res) => {
+  const level = req.verificationLevel === 'fully_verified' ? 'fully_verified' : 'verified';
+  const limits = limitsForUser(level);
   const used = await spentInLast24h(pool, req.userId);
   res.json({
-    perTransactionCentavos: LIMITS.perTransactionCentavos,
-    dailyCentavos: LIMITS.dailyCentavos,
-    maxBalanceCentavos: LIMITS.maxBalanceCentavos,
+    perTransactionCentavos: limits.perTransactionCentavos,
+    dailyCentavos: limits.dailyCentavos,
+    maxBalanceCentavos: limits.maxBalanceCentavos,
     usedCentavos: used,
-    remainingCentavos: Math.max(0, LIMITS.dailyCentavos - used),
+    remainingCentavos: Math.max(0, limits.dailyCentavos - used),
+    level,
   });
 }));
 
