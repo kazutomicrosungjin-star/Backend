@@ -389,7 +389,7 @@ function limitsForUser(level) {
 }
 
 // Money going out of the wallet counts toward the daily limit (store, food and games are bill payments).
-const SPENDING_TYPES = ['Send Money', 'Load', 'Bill Payment', 'QR Payment', 'Loan Repayment', 'Event Ticket'];
+const SPENDING_TYPES = ['Send Money', 'Load', 'Bill Payment', 'QR Payment', 'Loan Repayment', 'Event Ticket', 'Contribution', 'Savings Deposit'];
 
 function pesoText(centavos) {
   return `\u20B1${(centavos / 100).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
