@@ -3370,8 +3370,9 @@ app.post('/api/groups/:id/contribute', requireAuth, moneyLimiter, idempotent, re
 
 app.post('/api/groups/:id/requests', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
-  const { requesterName, reason, amountCentavos } = req.body || {};
-  const amt = parseCentavos(amountCentavos);
+  const requesterName = cleanText(req.body?.requesterName, 100);
+  const reason = cleanText(req.body?.reason, 255);
+  const amt = parseCentavos(req.body?.amountCentavos);
   if (!requesterName || !reason || amt === null) {
     return res.status(400).json({ error: 'requesterName, reason, and a positive amount (integer centavos) are required' });
   }
@@ -4136,7 +4137,7 @@ app.post('/api/admin/groups/:groupId/requests/:reqId/respond', requireAdmin, asy
         [
           'group',
           groupId,
-          `Sent to ${request.requester_name} (Support)`,
+          `Sent to ${cleanText(request.requester_name, 100)} (Support)`,
           'Withdrawal',
           requestAmount,
           0,
