@@ -2346,11 +2346,7 @@ app.post('/api/requests/split', requireAuth, moneyLimiter, idempotent, asyncRout
       share.requestId = result.insertId;
     }
 
-    await conn.commit();
-
-    // The creator chose these people, so their names and wallet IDs come back
-    // to them. This response is never returned to a payer.
-    res.json({
+    const body = {
       ok: true,
       totalCentavos: total,
       duplicatesIgnored,
@@ -2360,7 +2356,12 @@ app.post('/api/requests/split', requireAuth, moneyLimiter, idempotent, asyncRout
         walletId: s.user.wallet_id,
         amountCentavos: s.amountCentavos,
       })),
-    });
+    };
+    await commitWithIdempotency(conn, req, 200, body);
+
+    // The creator chose these people, so their names and wallet IDs come back
+    // to them. This response is never returned to a payer.
+    res.json(body);
   } catch (err) {
     await conn.rollback();
     throw err;
