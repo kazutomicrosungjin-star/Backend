@@ -3261,17 +3261,30 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, m
     if (approvals >= approvalsNeeded) {
       const amt = toCentavos(request.amount);
 
-      // name and username are loaded here so the two rows below can name the
-      // group and the requester instead of printing a group id and a user id.
-      // Both are columns on rows this route already reads and locks, so this
-      // is no extra query and no change to the lock order.
+      // The requester row is locked first, then the plain membership read,
+      // then the group row. That keeps this route's lock order user-then-group
+      // and stops a removed or suspended requester from being paid.
+      const [[requester]] = await conn.query(
+        'SELECT username, balance, verification_level, status FROM users WHERE id = ? FOR UPDATE',
+        [request.requester_id]
+      );
+      const [[requesterMembership]] = await conn.query(
+        'SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ? FOR SHARE',
+        [groupId, request.requester_id]
+      );
+      if (!requester || !requesterMembership || requester.status !== 'active') {
+        await conn.rollback();
+        return res.status(400).json({ error: 'The requester is no longer an active member of this group' });
+      }
+
+      // The group name keeps the ledger label readable; the group row is
+      // locked after the requester row, so the user-then-group order holds.
       const [[group]] = await conn.query('SELECT name, balance FROM `groups` WHERE id = ? FOR UPDATE', [groupId]);
       if (toCentavos(group.balance) < amt) {
         await conn.rollback();
         return res.status(400).json({ error: 'Group balance too low to complete this withdrawal now' });
       }
 
-      const [[requester]] = await conn.query('SELECT username, balance, verification_level FROM users WHERE id = ? FOR UPDATE', [request.requester_id]);
       const capError = recipientCapError(toCentavos(requester.balance), amt, limitsForUser(requester.verification_level));
       if (capError) {
         await conn.rollback();
