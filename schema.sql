@@ -145,6 +145,19 @@ CREATE TABLE IF NOT EXISTS transactions (
   KEY idx_tx_reversed (reversed_transfer_ref)
 ) ENGINE=InnoDB;
 
+-- ---------- double-charge protection ----------
+-- Also created at boot by server.js; keep both definitions identical.
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  user_id INT NOT NULL,
+  idem_key VARCHAR(64) NOT NULL,
+  request_hash CHAR(64) NULL,
+  status ENUM('processing','done') NOT NULL DEFAULT 'processing',
+  response_status SMALLINT NULL,
+  response_body TEXT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, idem_key)
+) ENGINE=InnoDB;
+
 -- ---------- payment requests (request money) ----------
 -- Also created at boot by server.js, and the two definitions must stay
 -- identical: schema.sql is the source of truth for a brand-new database, while

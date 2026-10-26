@@ -452,6 +452,7 @@ pool.execute(
   `CREATE TABLE IF NOT EXISTS idempotency_keys (
      user_id INT NOT NULL,
      idem_key VARCHAR(64) NOT NULL,
+     request_hash CHAR(64) NULL,
      status ENUM('processing','done') NOT NULL DEFAULT 'processing',
      response_status SMALLINT NULL,
      response_body TEXT NULL,
@@ -462,6 +463,33 @@ pool.execute(
 
 let idempotencyCalls = 0;
 
+// Hash the operation, not the credentials: keys are sorted so reordered JSON
+// still matches, and PIN/token fields are omitted before hashing.
+function stableBodyForHash(value) {
+  if (Array.isArray(value)) return value.map(stableBodyForHash);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const key of Object.keys(value).sort()) {
+      const normalized = key.toLowerCase();
+      if (normalized.endsWith('pin') || normalized.includes('token')) continue;
+      out[key] = stableBodyForHash(value[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+function idempotencyHash(req) {
+  const body = JSON.stringify(stableBodyForHash(req.body ?? null));
+  return crypto.createHash('sha256')
+    .update(req.method)
+    .update('\n')
+    .update(req.originalUrl)
+    .update('\n')
+    .update(body)
+    .digest('hex');
+}
+
 async function idempotent(req, res, next) {
   const key = req.get('Idempotency-Key');
   if (!key) return next();
@@ -469,17 +497,24 @@ async function idempotent(req, res, next) {
     return res.status(400).json({ error: 'Invalid Idempotency-Key' });
   }
   try {
+    const requestHash = idempotencyHash(req);
     // Housekeeping: keys stuck "processing" (the server restarted mid-request) and old results.
     await pool.execute("DELETE FROM idempotency_keys WHERE status = 'processing' AND created_at < (NOW() - INTERVAL 2 MINUTE)");
     if (++idempotencyCalls % 50 === 0) {
       await pool.execute('DELETE FROM idempotency_keys WHERE created_at < (NOW() - INTERVAL 1 DAY)');
     }
-    const [inserted] = await pool.execute('INSERT IGNORE INTO idempotency_keys (user_id, idem_key) VALUES (?, ?)', [req.userId, key]);
+    const [inserted] = await pool.execute(
+      'INSERT IGNORE INTO idempotency_keys (user_id, idem_key, request_hash) VALUES (?, ?, ?)',
+      [req.userId, key, requestHash]
+    );
     if (inserted.affectedRows === 0) {
       const [[row]] = await pool.query(
-        'SELECT status, response_status, response_body FROM idempotency_keys WHERE user_id = ? AND idem_key = ?',
+        'SELECT status, response_status, response_body, request_hash FROM idempotency_keys WHERE user_id = ? AND idem_key = ?',
         [req.userId, key]
       );
+      if (row && row.request_hash && row.request_hash !== requestHash) {
+        return res.status(409).json({ error: 'Idempotency-Key was already used for a different request' });
+      }
       if (row && row.status === 'done') {
         res.set('Idempotent-Replay', 'true');
         return res.status(row.response_status || 200).type('json').send(row.response_body);
@@ -490,22 +525,54 @@ async function idempotent(req, res, next) {
     return next(err);
   }
 
-  // Remember the outcome: successes are replayed, failures free the key so the person can try again.
+  req.idempotency = { key, finalized: false };
+
+  // Fallback for routes that have not switched to commitWithIdempotency yet.
+  // Once a route calls it, the helper owns the done state and this wrapper only
+  // sends the response.
   const sendJson = res.json.bind(res);
   res.json = (body) => {
     res.json = sendJson;
     const status = res.statusCode;
+    if (req.idempotency.finalized) {
+      return sendJson(body);
+    }
     const saved =
       status < 400
         ? pool.execute(
-            "UPDATE idempotency_keys SET status = 'done', response_status = ?, response_body = ? WHERE user_id = ? AND idem_key = ?",
+            "UPDATE idempotency_keys SET status = 'done', response_status = ?, response_body = ? WHERE user_id = ? AND idem_key = ? AND status = 'processing'",
             [status, JSON.stringify(body), req.userId, key]
           )
-        : pool.execute('DELETE FROM idempotency_keys WHERE user_id = ? AND idem_key = ?', [req.userId, key]);
+        : pool.execute(
+            "DELETE FROM idempotency_keys WHERE user_id = ? AND idem_key = ? AND status = 'processing'",
+            [req.userId, key]
+          );
     saved.catch((err) => console.error('Could not update idempotency key:', err.message));
     return sendJson(body);
   };
   next();
+}
+
+async function commitWithIdempotency(conn, req, status, body) {
+  const idem = req.idempotency;
+  if (idem?.key) {
+    if (!Number.isInteger(status) || status < 200 || status >= 400) {
+      throw new Error('commitWithIdempotency requires a success status');
+    }
+    const [result] = await conn.execute(
+      `UPDATE idempotency_keys
+          SET status = 'done', response_status = ?, response_body = ?
+        WHERE user_id = ? AND idem_key = ? AND status = 'processing'`,
+      [status, JSON.stringify(body), req.userId, idem.key]
+    );
+    if (result.affectedRows !== 1) {
+      const err = new Error('Idempotency key is no longer processing');
+      err.code = 'IDEMPOTENCY_KEY_LOST';
+      throw err;
+    }
+    idem.finalized = true;
+  }
+  await conn.commit();
 }
 
 // 13 digits, shown as "4829 105 837261" on receipts.
