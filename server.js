@@ -276,7 +276,7 @@ async function refreshUserInIndex(userId) {
   try {
     await refreshUserInIndexUnsafe(userId);
   } catch (err) {
-    console.error(err.message);
+    console.error('refreshUserInIndex failed:', err.message);
   }
 }
 
