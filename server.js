@@ -1890,8 +1890,6 @@ app.post('/api/wallet/pay', requireAuth, moneyLimiter, idempotent, requirePin, a
 
   const conn = await pool.getConnection();
   try {
-    await conn.beginTransaction();
-
     // status = 'active' so a suspended account cannot be paid, matching what
     // POST /api/requests already requires. A suspended recipient simply does not
     // resolve, so it falls into the !recipient branch below and gets the SAME 404
@@ -1899,6 +1897,9 @@ app.post('/api/wallet/pay', requireAuth, moneyLimiter, idempotent, requirePin, a
     // route must not be usable to find out which Wallet IDs belong to suspended
     // accounts. No other check, the lock order, or the balance maths changes.
     const [[found]] = await conn.query("SELECT id FROM users WHERE wallet_id = ? AND status = 'active'", [walletId]);
+    // Begin after the id lookup: its plain read must not pin the REPEATABLE
+    // READ snapshot before the FOR UPDATE locks below.
+    await conn.beginTransaction();
     const lockIds = [req.userId, ...(found ? [found.id] : [])].sort((a, b) => a - b);
     await conn.query(`SELECT id FROM users WHERE id IN (${lockIds.map(() => '?').join(',')}) ORDER BY id FOR UPDATE`, lockIds);
     // username is loaded here so the receiver's row can name the sender
@@ -1934,7 +1935,14 @@ app.post('/api/wallet/pay', requireAuth, moneyLimiter, idempotent, requirePin, a
 
     const transferRef = crypto.randomUUID();
     const ref = newReferenceNumber();
-    await conn.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [amt, sender.id]);
+    const [debit] = await conn.execute(
+      'UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?',
+      [amt, sender.id, amt]
+    );
+    if (debit.affectedRows !== 1) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
     await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, recipient.id]);
     await conn.execute(
       'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref, details) VALUES (?,?,?,?,?,?,?,?)',
