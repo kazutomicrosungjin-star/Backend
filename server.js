@@ -3067,7 +3067,10 @@ app.get('/api/groups/:id/withdraw-requests', requireAuth, asyncRoute(async (req,
   const [rows] = await pool.execute(
     `SELECT wr.id, wr.requester_id AS requesterId, u.username AS requesterName,
             wr.amount, wr.reason, wr.status, wr.approvals_needed AS approvalsNeeded,
-            (SELECT COUNT(*) FROM group_withdraw_approvals wa WHERE wa.request_id = wr.id AND wa.decision = 'approve') AS approvalsCount,
+            (SELECT COUNT(*)
+               FROM group_withdraw_approvals wa
+               JOIN group_members gm ON gm.user_id = wa.member_id AND gm.group_id = wr.group_id
+              WHERE wa.request_id = wr.id AND wa.decision = 'approve') AS approvalsCount,
             EXISTS(SELECT 1 FROM group_withdraw_approvals wa WHERE wa.request_id = wr.id AND wa.member_id = ?) AS decidedByMe
      FROM group_withdraw_requests wr JOIN users u ON u.id = wr.requester_id
      WHERE wr.group_id = ? AND wr.status = 'pending'
@@ -3262,8 +3265,11 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, m
     }
 
     const [[{ approvals }]] = await conn.query(
-      "SELECT COUNT(*) AS approvals FROM group_withdraw_approvals WHERE request_id = ? AND decision = 'approve' AND member_id <> ?",
-      [reqId, request.requester_id]
+      `SELECT COUNT(*) AS approvals
+         FROM group_withdraw_approvals wa
+         JOIN group_members gm ON gm.user_id = wa.member_id AND gm.group_id = ?
+        WHERE wa.request_id = ? AND wa.decision = 'approve' AND wa.member_id <> ?`,
+      [groupId, reqId, request.requester_id]
     );
 
     if (approvals >= approvalsNeeded) {
