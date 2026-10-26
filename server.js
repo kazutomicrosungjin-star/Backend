@@ -2589,8 +2589,10 @@ app.post('/api/send', requireAuth, moneyLimiter, idempotent, requirePin, asyncRo
 
   const conn = await pool.getConnection();
   try {
-    await conn.beginTransaction();
     const [[found]] = await conn.query('SELECT id FROM users WHERE wallet_id = ?', [recipient]);
+    // Begin after the id lookup: its plain read must not pin the REPEATABLE
+    // READ snapshot before the FOR UPDATE locks below.
+    await conn.beginTransaction();
     const lockIds = [req.userId, ...(found ? [found.id] : [])].sort((a, b) => a - b);
     await conn.query(`SELECT id FROM users WHERE id IN (${lockIds.map(() => '?').join(',')}) ORDER BY id FOR UPDATE`, lockIds);
     // username is loaded here so the receiver's row can name the sender
@@ -2628,7 +2630,14 @@ app.post('/api/send', requireAuth, moneyLimiter, idempotent, requirePin, asyncRo
 
     const transferRef = crypto.randomUUID();
     const ref = newReferenceNumber();
-    await conn.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [amt, sender.id]);
+    const [debit] = await conn.execute(
+      'UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?',
+      [amt, sender.id, amt]
+    );
+    if (debit.affectedRows !== 1) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
     await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, recipientUser.id]);
     await conn.execute(
       'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref, details) VALUES (?,?,?,?,?,?,?,?)',
