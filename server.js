@@ -3292,7 +3292,11 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, m
       await conn.execute("UPDATE group_withdraw_requests SET status = 'approved' WHERE id = ?", [reqId]);
 
       await conn.commit();
-      await refreshUserInIndex(request.requester_id);
+      try {
+        await refreshUserInIndex(request.requester_id);
+      } catch (err) {
+        console.error('post-commit refresh failed:', err.message);
+      }
       return res.json({ ok: true, status: 'approved', executed: true });
     }
 
@@ -3357,7 +3361,11 @@ app.post('/api/groups/:id/contribute', requireAuth, moneyLimiter, idempotent, re
 
     // Row is committed — refresh so the index doesn't serve a stale
     // balance (item #6 fix).
-    await refreshUserInIndex(req.userId);
+    try {
+      await refreshUserInIndex(req.userId);
+    } catch (err) {
+      console.error('post-commit refresh failed:', err.message);
+    }
 
     res.json({ ok: true });
   } catch (err) {
