@@ -273,6 +273,14 @@ function pushToUser(userId, payload) {
 }
 
 async function refreshUserInIndex(userId) {
+  try {
+    await refreshUserInIndexUnsafe(userId);
+  } catch (err) {
+    console.error(err.message);
+  }
+}
+
+async function refreshUserInIndexUnsafe(userId) {
   const [[row]] = await pool.query('SELECT * FROM users WHERE id = ?', [userId]);
   if (!row) {
     // User was deleted — grab the wallet_id from what we still have
@@ -3261,7 +3269,7 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, m
     if (approvals >= approvalsNeeded) {
       const amt = toCentavos(request.amount);
 
-      // The requester row is locked first, then the plain membership read,
+      // The requester row is locked first, then the locking membership read,
       // then the group row. That keeps this route's lock order user-then-group
       // and stops a removed or suspended requester from being paid.
       const [[requester]] = await conn.query(
