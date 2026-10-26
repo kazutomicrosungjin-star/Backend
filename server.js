@@ -2176,7 +2176,7 @@ app.post('/api/requests/split', requireAuth, moneyLimiter, idempotent, asyncRout
     // single-request route does, for every entry at once. status = 'active'
     // here means a suspended account simply does not come back, which is why
     // the not-found message below deliberately does not say which it was.
-    const [[found]] = await conn.query(
+    const [found] = await conn.query(
       `SELECT id, username, wallet_id, phone_number FROM users
         WHERE status = 'active'
           AND (wallet_id IN (${entries.map(() => '?').join(',')})
