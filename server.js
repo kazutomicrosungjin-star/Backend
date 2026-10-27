@@ -4414,8 +4414,12 @@ app.post('/api/undo', requireAuth, moneyLimiter, idempotent, requirePin, asyncRo
     return res.status(400).json({ error: 'Undo is only available for 60 seconds after a payment' });
   }
   const transferRef = entry.ref;
+  let committed = false; // only after commitWithIdempotency returns
 
-  const conn = await pool.getConnection();
+  const conn = await pool.getConnection().catch((err) => {
+    stack.push(entry);
+    throw err;
+  });
   try {
     await conn.beginTransaction();
     const result = await reverseTransferByRef(conn, transferRef);
@@ -4424,12 +4428,14 @@ app.post('/api/undo', requireAuth, moneyLimiter, idempotent, requirePin, asyncRo
       stack.push(entry); // undo failed — put it back so the user can see why / retry later
       return res.status(result.status).json({ error: result.error });
     }
-    await conn.commit();
+    const body = { ok: true, undone: transferRef, reversalTransferRef: result.reversalTransferRef };
+    await commitWithIdempotency(conn, req, 200, body);
+    committed = true;
     await Promise.all([...result.affectedUserIds].map(refreshUserInIndex));
-    res.json({ ok: true, undone: transferRef, reversalTransferRef: result.reversalTransferRef });
+    res.json(body);
   } catch (err) {
     await conn.rollback();
-    stack.push(entry);
+    if (!committed) stack.push(entry);
     throw err;
   } finally {
     conn.release();
