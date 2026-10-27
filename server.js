@@ -2020,7 +2020,8 @@ app.post('/api/wallet/pay', requireAuth, moneyLimiter, idempotent, requirePin, a
       ['user', recipient.id, `QR Payment from ${cleanText(sender.username, 60)}`, 'QR Payment', amt, 1, transferRef, referenceDetails(ref)]
     );
 
-    await conn.commit();
+    const body = { ok: true, referenceNumber: ref, recipientName: recipient.username };
+    await commitWithIdempotency(conn, req, 200, body);
 
     // Row is committed — now safe to refresh both cached users so the
     // hash-map indexes don't serve a stale balance (item #6 fix).
@@ -2035,7 +2036,7 @@ app.post('/api/wallet/pay', requireAuth, moneyLimiter, idempotent, requirePin, a
     // already return. The username was already loaded into `recipient` above, so
     // this adds nothing to the query and exposes no new column - the payer needs
     // to see who they paid.
-    res.json({ ok: true, referenceNumber: ref, recipientName: recipient.username });
+    res.json(body);
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -2172,9 +2173,10 @@ app.post('/api/requests/:id/pay', requireAuth, moneyLimiter, idempotent, require
       ['user', requester.id, `Request paid by ${payer.username}`, 'Send Money', amt, 1, transferRef, referenceDetails(ref)]
     );
     await conn.execute("UPDATE payment_requests SET status = 'paid', reference = ?, responded_at = NOW() WHERE id = ?", [ref, request.id]);
-    await conn.commit();
+    const body = { ok: true, referenceNumber: ref, recipientName: requester.username };
+    await commitWithIdempotency(conn, req, 200, body);
     await Promise.all([refreshUserInIndex(payer.id), refreshUserInIndex(requester.id)]);
-    res.json({ ok: true, referenceNumber: ref, recipientName: requester.username });
+    res.json(body);
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -2724,7 +2726,8 @@ app.post('/api/send', requireAuth, moneyLimiter, idempotent, requirePin, asyncRo
       ['user', recipientUser.id, `Received from ${cleanText(sender.username, 60)}`, 'Send Money', amt, 1, transferRef, referenceDetails(ref)]
     );
 
-    await conn.commit();
+    const body = { ok: true, referenceNumber: ref, recipientName: recipientUser.username };
+    await commitWithIdempotency(conn, req, 200, body);
 
     // <-- NEW: only line added to this whole route
     await Promise.all([
@@ -2734,7 +2737,7 @@ app.post('/api/send', requireAuth, moneyLimiter, idempotent, requirePin, asyncRo
 
     getUndoStack(sender.id).push({ ref: transferRef, at: Date.now() }); // NEW — item: mandatory "Stack"
 
-    res.json({ ok: true, referenceNumber: ref, recipientName: recipientUser.username });
+    res.json(body);
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -3471,7 +3474,8 @@ app.post('/api/groups/:id/contribute', requireAuth, moneyLimiter, idempotent, re
       'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
       ['user', req.userId, `Contribution to group #${groupId}`, 'Contribution', amt, 0]
     );
-    await conn.commit();
+    const body = { ok: true };
+    await commitWithIdempotency(conn, req, 200, body);
 
     // Row is committed — refresh so the index doesn't serve a stale
     // balance (item #6 fix).
@@ -3481,7 +3485,7 @@ app.post('/api/groups/:id/contribute', requireAuth, moneyLimiter, idempotent, re
       console.error('post-commit refresh failed:', err.message);
     }
 
-    res.json({ ok: true });
+    res.json(body);
   } catch (err) {
     await conn.rollback();
     throw err;
