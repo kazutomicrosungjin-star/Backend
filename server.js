@@ -3637,9 +3637,10 @@ app.post('/api/savings/:id/withdraw', requireAuth, moneyLimiter, idempotent, req
       ['user', req.userId, `Savings withdrawal: ${goal.name}`, 'Savings Withdrawal', amt, 1]
     );
 
-    await conn.commit();
+    const body = { ok: true, savedAmount: newSaved };
+    await commitWithIdempotency(conn, req, 200, body);
     await refreshUserInIndex(req.userId);
-    res.json({ ok: true, savedAmount: newSaved });
+    res.json(body);
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -3677,9 +3678,10 @@ app.delete('/api/savings/:id', requireAuth, moneyLimiter, idempotent, requirePin
       );
     }
     await conn.execute('DELETE FROM savings_goals WHERE id = ?', [goalId]);
-    await conn.commit();
+    const body = { ok: true, returnedCentavos: saved };
+    await commitWithIdempotency(conn, req, 200, body);
     await refreshUserInIndex(req.userId);
-    res.json({ ok: true, returnedCentavos: saved });
+    res.json(body);
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -4594,13 +4596,14 @@ app.post('/api/loans/:id/repay', requireAuth, moneyLimiter, idempotent, requireP
       ['user', req.userId, `Loan Repayment (${cleanText(loan.loan_type, 40)})`, 'Loan Repayment', applied, 0]
     );
 
-    await conn.commit();
+    const body = { ok: true, remaining: loanAmount - newRepaid };
+    await commitWithIdempotency(conn, req, 200, body);
 
     // Row is committed — refresh so the index doesn't serve a stale
     // balance (item #6 fix).
     await refreshUserInIndex(req.userId);
 
-    res.json({ ok: true, remaining: loanAmount - newRepaid });
+    res.json(body);
   } catch (err) {
     await conn.rollback();
     throw err;
