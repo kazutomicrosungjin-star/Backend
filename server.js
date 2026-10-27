@@ -2823,13 +2823,14 @@ app.post('/api/bills/pay', requireAuth, moneyLimiter, idempotent, requirePin, as
       ['user', req.userId, `Bill Pay to ${biller}`, 'Bill Payment', amt, 0, referenceDetails(ref)]
     );
 
-    await conn.commit();
+    const body = { ok: true, referenceNumber: ref };
+    await commitWithIdempotency(conn, req, 200, body);
 
     // Row is committed — refresh so the index doesn't serve a stale
     // balance (item #6 fix).
     await refreshUserInIndex(req.userId);
 
-    res.json({ ok: true, referenceNumber: ref });
+    res.json(body);
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -3580,9 +3581,10 @@ app.post('/api/savings/:id/deposit', requireAuth, moneyLimiter, idempotent, requ
       ['user', req.userId, `Savings: ${goal.name}`, 'Savings Deposit', amt, 0]
     );
 
-    await conn.commit();
+    const body = { ok: true, savedAmount: newSaved, completed: nowComplete };
+    await commitWithIdempotency(conn, req, 200, body);
     await refreshUserInIndex(req.userId);
-    res.json({ ok: true, savedAmount: newSaved, completed: nowComplete });
+    res.json(body);
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -3801,13 +3803,7 @@ app.post('/api/events/:id/tickets', requireAuth, moneyLimiter, idempotent, requi
       [req.userId, eventId, ticketCode, quantity, amount]
     );
 
-    await conn.commit();
-
-    // Both rows are committed - refresh so the index doesn't serve a stale
-    // balance (item #6 fix).
-    await refreshUserInIndex(req.userId);
-
-    res.json({
+    const body = {
       ok: true,
       referenceNumber: ref,
       ticket: {
@@ -3820,7 +3816,14 @@ app.post('/api/events/:id/tickets', requireAuth, moneyLimiter, idempotent, requi
         venue: event.venue,
         startsAt: event.starts_at,
       },
-    });
+    };
+    await commitWithIdempotency(conn, req, 200, body);
+
+    // Both rows are committed - refresh so the index doesn't serve a stale
+    // balance (item #6 fix).
+    await refreshUserInIndex(req.userId);
+
+    res.json(body);
   } catch (err) {
     await conn.rollback();
     throw err;
