@@ -3350,8 +3350,9 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, m
 
     if (!approve) {
       await conn.execute("UPDATE group_withdraw_requests SET status = 'declined' WHERE id = ?", [reqId]);
-      await conn.commit();
-      return res.json({ ok: true, status: 'declined' });
+      const body = { ok: true, status: 'declined' };
+      await commitWithIdempotency(conn, req, 200, body);
+      return res.json(body);
     }
 
     const [[{ approvals }]] = await conn.query(
@@ -3408,17 +3409,19 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, m
       );
       await conn.execute("UPDATE group_withdraw_requests SET status = 'approved' WHERE id = ?", [reqId]);
 
-      await conn.commit();
+      const body = { ok: true, status: 'approved', executed: true };
+      await commitWithIdempotency(conn, req, 200, body);
       try {
         await refreshUserInIndex(request.requester_id);
       } catch (err) {
         console.error('post-commit refresh failed:', err.message);
       }
-      return res.json({ ok: true, status: 'approved', executed: true });
+      return res.json(body);
     }
 
-    await conn.commit();
-    res.json({ ok: true, status: 'pending', approvalsCount: approvals, approvalsNeeded });
+    const body = { ok: true, status: 'pending', approvalsCount: approvals, approvalsNeeded };
+    await commitWithIdempotency(conn, req, 200, body);
+    res.json(body);
   } catch (err) {
     await conn.rollback();
     throw err;
