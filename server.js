@@ -2775,13 +2775,14 @@ app.post('/api/load', requireAuth, moneyLimiter, idempotent, requirePin, asyncRo
       ['user', req.userId, `Mobile Load to ${number}`, 'Load', amt, 0, referenceDetails(ref)]
     );
 
-    await conn.commit();
+    const body = { ok: true, referenceNumber: ref };
+    await commitWithIdempotency(conn, req, 200, body);
 
     // Row is committed — refresh so the index doesn't serve a stale
     // balance (item #6 fix).
     await refreshUserInIndex(req.userId);
 
-    res.json({ ok: true, referenceNumber: ref });
+    res.json(body);
   } catch (err) {
     await conn.rollback();
     throw err;
