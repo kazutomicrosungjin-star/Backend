@@ -340,18 +340,21 @@ CREATE TABLE IF NOT EXISTS phone_otps (
   KEY idx_phone_otps (phone_number, created_at)
 ) ENGINE=InnoDB;
 
--- ---------- password reset codes (admin-assisted until SMS is wired) ----------
--- Only a hash is stored. One live code per user: issuing a new one marks the
--- old ones used. A code dies on first use, after 5 wrong tries, or at expires_at.
+-- ---------- password / PIN reset codes (admin-assisted until SMS is wired) ----------
+-- Only a hash is stored, bound to the user id AND the purpose. One live code
+-- per user per purpose: issuing a new one marks the old ones of that purpose
+-- used. A code dies on first use, after 5 wrong tries, or at expires_at.
 CREATE TABLE IF NOT EXISTS password_resets (
   id INT AUTO_INCREMENT PRIMARY KEY,
   user_id INT NOT NULL,
+  purpose ENUM('password','pin') NOT NULL DEFAULT 'password',
   code_hash CHAR(64) NOT NULL,
   expires_at DATETIME NOT NULL,
   attempts INT NOT NULL DEFAULT 0,
   used_at DATETIME NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_password_resets_user (user_id, created_at),
+  KEY idx_password_resets_user_purpose (user_id, purpose, created_at),
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
