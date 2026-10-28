@@ -340,6 +340,21 @@ CREATE TABLE IF NOT EXISTS phone_otps (
   KEY idx_phone_otps (phone_number, created_at)
 ) ENGINE=InnoDB;
 
+-- ---------- password reset codes (admin-assisted until SMS is wired) ----------
+-- Only a hash is stored. One live code per user: issuing a new one marks the
+-- old ones used. A code dies on first use, after 5 wrong tries, or at expires_at.
+CREATE TABLE IF NOT EXISTS password_resets (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  code_hash CHAR(64) NOT NULL,
+  expires_at DATETIME NOT NULL,
+  attempts INT NOT NULL DEFAULT 0,
+  used_at DATETIME NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_password_resets_user (user_id, created_at),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
 -- ---------- cash-in requests (simulated) ----------
 -- Also created at boot by server.js. 'rejected' is set by
 -- POST /api/admin/cashins/:id/respond when an admin declines a request.
