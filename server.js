@@ -987,6 +987,36 @@ function hashOtp(phone, code) {
   return crypto.createHmac('sha256', JWT_SECRET).update(`${phone}:${code}`).digest('hex');
 }
 
+// Canonical phone shape used by users.phone_number and users.wallet_id:
+// 09XXXXXXXXX. Mirrors normalizePhMobile() in the Flutter app exactly, so the
+// client and server agree on what a valid PH mobile number is.
+function normalizePhone(value) {
+  if (typeof value !== 'string') return null;
+  let digits = value.replace(/[\s-]/g, '');
+  if (digits.startsWith('+63')) digits = `0${digits.slice(3)}`;
+  else if (digits.startsWith('63') && digits.length === 12) digits = `0${digits.slice(2)}`;
+  return /^09\d{9}$/.test(digits) ? digits : null;
+}
+
+// These routes read the phone before their own validation, so normalize at the
+// route edge. Exact paths only: PCST-123456 returns null from normalizePhone()
+// and is left exactly as it was.
+app.post('/api/register', (req, res, next) => {
+  const phone = normalizePhone(req.body?.phoneNumber);
+  if (phone) req.body.phoneNumber = phone;
+  next();
+});
+app.get('/api/wallet/lookup', (req, res, next) => {
+  const phone = normalizePhone(req.query?.walletId);
+  if (phone) req.query.walletId = phone;
+  next();
+});
+app.get('/api/admin/users', (req, res, next) => {
+  const phone = normalizePhone(req.query?.search);
+  if (phone) req.query.search = phone;
+  next();
+});
+
 const otpSendLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 20,
@@ -1006,8 +1036,8 @@ const otpVerifyLimiter = rateLimit({
 });
 
 app.post('/api/phone/send-otp', otpSendLimiter, asyncRoute(async (req, res) => {
-  const phoneNumber = req.body?.phoneNumber;
-  if (typeof phoneNumber !== 'string' || !/^09\d{9}$/.test(phoneNumber)) {
+  const phoneNumber = normalizePhone(req.body?.phoneNumber);
+  if (!phoneNumber) {
     return res.status(400).json({ error: 'Phone number must be 11 digits starting with 09 (e.g. 09171234567)' });
   }
   if (!smsIsReal && !OTP_DEV_MODE) {
@@ -1066,8 +1096,9 @@ app.post('/api/phone/send-otp', otpSendLimiter, asyncRoute(async (req, res) => {
 }));
 
 app.post('/api/phone/verify-otp', otpVerifyLimiter, asyncRoute(async (req, res) => {
-  const { phoneNumber, code } = req.body || {};
-  if (typeof phoneNumber !== 'string' || !/^09\d{9}$/.test(phoneNumber) || typeof code !== 'string' || !/^\d{6}$/.test(code)) {
+  const { code } = req.body || {};
+  const phoneNumber = normalizePhone(req.body?.phoneNumber);
+  if (!phoneNumber || typeof code !== 'string' || !/^\d{6}$/.test(code)) {
     return res.status(400).json({ error: 'Enter the 6-digit code we sent you' });
   }
   const [rows] = await pool.execute(
@@ -1109,7 +1140,8 @@ app.post('/api/phone/verify-otp', otpVerifyLimiter, asyncRoute(async (req, res) 
 
 app.get('/api/register/check', availabilityLimiter, asyncRoute(async (req, res) => {
   const username = (req.query.username || '').toString().trim();
-  const phone = (req.query.phone || '').toString().trim();
+  const phoneInput = (req.query.phone || '').toString().trim();
+  const phone = normalizePhone(phoneInput) || phoneInput;
   let usernameTaken = false;
   let phoneTaken = false;
   if (username) {
@@ -1669,7 +1701,8 @@ const resetIdentifierLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => {
-    const identifier = String(req.body?.identifier || '').trim().toUpperCase();
+    const raw = String(req.body?.identifier || '').trim().toUpperCase();
+    const identifier = normalizePhone(raw) || raw;
     return identifier ? `pwreset:${identifier}` : ipKeyGenerator(req);
   },
   message: { error: 'Too many attempts. Please try again later.' },
@@ -1694,7 +1727,8 @@ async function findResetUser(identifier) {
 }
 
 app.post('/api/auth/forgot-password', resetIpLimiter, resetIdentifierLimiter, asyncRoute(async (req, res) => {
-  const identifier = String(req.body?.identifier || '').trim().toUpperCase();
+  const rawIdentifier = String(req.body?.identifier || '').trim().toUpperCase();
+  const identifier = normalizePhone(rawIdentifier) || rawIdentifier;
   // Identical body and status whether the account exists or not.
   const generic = {
     ok: true,
@@ -1711,7 +1745,8 @@ app.post('/api/auth/forgot-password', resetIpLimiter, resetIdentifierLimiter, as
 }));
 
 app.post('/api/auth/reset-password', resetIpLimiter, resetIdentifierLimiter, asyncRoute(async (req, res) => {
-  const identifier = String(req.body?.identifier || '').trim().toUpperCase();
+  const rawIdentifier = String(req.body?.identifier || '').trim().toUpperCase();
+  const identifier = normalizePhone(rawIdentifier) || rawIdentifier;
   const { code, newPassword } = req.body || {};
   // One message for "no account", "no live code", "expired", "too many tries"
   // and "wrong code" so the endpoint cannot be used to probe accounts.
@@ -2141,7 +2176,8 @@ app.get('/api/wallet/lookup', requireAuth, walletLookupLimiter, asyncRoute(async
 }));
 
 app.post('/api/wallet/pay', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
-  const { walletId, amountCentavos } = req.body || {};
+  const { amountCentavos } = req.body || {};
+  const walletId = normalizePhone(req.body?.walletId) || req.body?.walletId;
   const amt = parseCentavos(amountCentavos);
   if (!walletId || amt === null) {
     return res.status(400).json({ error: 'walletId and a positive amount (integer centavos) are required' });
@@ -2274,7 +2310,8 @@ function requestView(row, mine) {
 }
 
 app.post('/api/requests', requireAuth, moneyLimiter, asyncRoute(async (req, res) => {
-  const walletId = String(req.body?.walletId || '').trim();
+  const rawWalletId = String(req.body?.walletId || '').trim();
+  const walletId = normalizePhone(rawWalletId) || rawWalletId;
   const amt = parseCentavos(req.body?.amountCentavos);
   // cleanText, like the split route below: it strips <, > and control
   // characters, so a note can never carry HTML into a client.
@@ -2428,7 +2465,10 @@ app.post('/api/requests/split', requireAuth, moneyLimiter, idempotent, asyncRout
   if (raw.length > MAX_SPLIT_PARTICIPANTS) {
     return res.status(400).json({ error: `A split can have at most ${MAX_SPLIT_PARTICIPANTS} people` });
   }
-  const entries = raw.map((e) => (typeof e === 'string' ? e.trim() : ''));
+  const entries = raw.map((e) => {
+    const entry = typeof e === 'string' ? e.trim() : '';
+    return normalizePhone(entry) || entry;
+  });
   if (entries.some((e) => !e)) {
     return res.status(400).json({ error: 'Every person in the split needs a Wallet ID or phone number' });
   }
@@ -2851,7 +2891,8 @@ app.get('/api/alerts', requireAuth, alertsLimiter, asyncRoute(async (req, res) =
 }));
 
 app.post('/api/send', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
-  const recipient = req.body?.recipient?.toString().trim();
+  const rawRecipient = req.body?.recipient?.toString().trim();
+  const recipient = normalizePhone(rawRecipient) || rawRecipient;
   const amt = parseCentavos(req.body?.amountCentavos);
   if (!recipient || amt === null) {
     return res.status(400).json({ error: 'recipient and a positive amount (integer centavos) are required' });
@@ -4997,7 +5038,7 @@ app.get('/api/admin/accounts/traverse', requireAdmin, (req, res) => {
 });
 
 app.get('/api/admin/accounts/avl-search/:walletId', requireAdmin, (req, res) => {
-  const walletId = req.params.walletId;
+  const walletId = normalizePhone(req.params.walletId) || req.params.walletId;
   const account = walletAvl.search(walletId);
 
   if (!account) {
