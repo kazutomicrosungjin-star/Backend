@@ -13,6 +13,14 @@
 // oversight) rather than reimplementing every screen (bills/load/etc.) —
 // those follow the exact same parameterized-query + hashed-auth pattern,
 // so ask if you'd like them added too.
+//
+// SIGN-UP / VERIFICATION MODEL (GCash-style):
+//   - Sign-up only needs username, password, PIN, phone number (SMS code)
+//     and the terms. No ID number, ID photos or selfie are collected.
+//   - New accounts start at verification_level 'basic' (limited access).
+//   - To unlock higher limits, the user submits their ID number, ID photos
+//     and a selfie through POST /api/verification/upgrade. An admin reviews
+//     it, and on approval the account becomes 'fully_verified'.
 
 require('dotenv').config();
 const express = require('express');
@@ -132,11 +140,11 @@ const verificationUpgradeLimiter = rateLimit({
 });
 
 // Default express.json() limit is 100kb, which is too small for base64 photos.
-// Registration's three photos keep their existing 15mb limit. Verification
+// Sign-up no longer carries any photos (they moved to the verification
+// upgrade), so /api/register uses the normal small parser. Verification
 // upgrades are sized for the six-photo worst case (6 x 6,000,000 characters),
 // so 35mb (36,700,160 bytes) covers 36,000,000 bytes plus JSON overhead
 // without raising the limit on any other route.
-app.use('/api/register', express.json({ limit: '15mb' }));
 // Auth and throttling run before the large parser, so rejected requests never
 // parse a 35mb body. requireAuth is a hoisted function declaration.
 app.use('/api/verification/upgrade', requireAuth, verificationUpgradeLimiter, express.json({ limit: '35mb' }));
@@ -232,7 +240,7 @@ const MAX_CENTAVOS = 100_000_000_00; // ₱100,000,000.00 — sanity ceiling, ad
 // touches a user row. Safe to discard and rebuild at any time via
 // loadIndexesFromDatabase().
 const usersByUsername = new Map(); // username -> user row
-const usersByWalletId = new Map(); // wallet_id -> user row 
+const usersByWalletId = new Map(); // wallet_id -> user row
 async function loadIndexesFromDatabase() {
   const [rows] = await pool.query('SELECT * FROM users');
   usersByUsername.clear();
@@ -400,13 +408,20 @@ if (!fullyVerifiedConfigured) {
   console.warn('[limits] FULLY_VERIFIED_LIMIT_* is not fully configured; using verified limits for missing values.');
 }
 
+const BASIC_LIMITS = {
+  perTransactionCentavos: Number(process.env.BASIC_LIMIT_PER_TRANSACTION_PESOS || 2000) * 100,
+  dailyCentavos: Number(process.env.BASIC_LIMIT_DAILY_PESOS || 5000) * 100,
+  maxBalanceCentavos: Number(process.env.BASIC_LIMIT_MAX_BALANCE_PESOS || 10000) * 100,
+};
+
 const LIMITS_BY_LEVEL = {
+  basic: BASIC_LIMITS,
   verified: LIMITS,
   fully_verified: FULLY_VERIFIED_LIMITS,
 };
 
 function limitsForUser(level) {
-  return level === 'fully_verified' ? LIMITS_BY_LEVEL.fully_verified : LIMITS_BY_LEVEL.verified;
+  return LIMITS_BY_LEVEL[level] || LIMITS;
 }
 
 // Money going out of the wallet counts toward the daily limit (store, food and games are bill payments).
@@ -690,7 +705,7 @@ async function logAdminEvent(req, action, adminId, who) {
 // ID photos waiting for review are encrypted in the database (AES-256-GCM).
 // Set PHOTO_ENCRYPTION_KEY to 64 hex characters:
 //   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-// Without the key, photos are stored as before. Set it before the first sign-up.
+// Without the key, photos are stored as before. Set it before the first upgrade request.
 const PHOTO_KEY = /^[0-9a-f]{64}$/i.test(process.env.PHOTO_ENCRYPTION_KEY || '')
   ? Buffer.from(process.env.PHOTO_ENCRYPTION_KEY, 'hex')
   : null;
@@ -834,10 +849,10 @@ const FACEPP_COMPARE_URL = 'https://api-us.faceplusplus.com/facepp/v3/compare';
 
 // image1Base64 / image2Base64 should be raw base64 (no "data:image/..." prefix).
 // Returns { confidence, matched } on success, or throws on a Face++/network error.
-// Free Face++ keys only allow about one request at a time. Registration makes
+// Free Face++ keys only allow about one request at a time. Verification makes
 // several Face++ calls in a row (duplicate search, ID comparison, adding the
 // face), so any of them can come back "CONCURRENCY_LIMIT_EXCEEDED". Instead of
-// failing (which sent accounts to manual review with no score), wait a moment
+// failing (which sent requests to manual review with no score), wait a moment
 // and try again, up to 4 times.
 async function faceppFetch(url, form) {
   let last = null;
@@ -887,9 +902,9 @@ async function compareFaces(image1Base64, image2Base64) {
 //
 // compareFaces() above only checks that the selfie matches the ID photo in the
 // SAME submission. It can't tell if this face already has another account. For
-// that, every registered selfie is stored in a Face++ FaceSet and each new
+// that, every approved selfie is stored in a Face++ FaceSet and each new
 // selfie is searched against it. If any Face++ call fails the check is
-// skipped (fail-open, same as compareFaces) so registration never breaks.
+// skipped (fail-open, same as compareFaces) so verification never breaks.
 const FACEPP_BASE = 'https://api-us.faceplusplus.com/facepp/v3';
 const FACESET_OUTER_ID = process.env.FACESET_OUTER_ID || 'paycst_users';
 // Similarity (0-100) at or above which a new selfie counts as "already registered".
@@ -940,7 +955,7 @@ async function addFaceToIndex(faceToken) {
 }
 
 // Lets the app tell people "username / number already used" BEFORE they go
-// through the ID + selfie scan. Answers only those two yes/no questions.
+// through sign-up. Answers only those two yes/no questions.
 const availabilityLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 40,
@@ -1131,7 +1146,7 @@ app.post('/api/phone/verify-otp', otpVerifyLimiter, asyncRoute(async (req, res) 
 
   await pool.execute('UPDATE phone_otps SET consumed = 1 WHERE id = ?', [row.id]);
   // Proof of ownership that /api/register checks. Valid for 15 minutes (long enough
-  // to finish the ID + selfie steps) and only for this exact phone number.
+  // to finish the sign-up form) and only for this exact phone number.
   const verificationToken = sign({ purpose: 'phone-verify', phone: phoneNumber }, '15m');
   res.json({ ok: true, verificationToken });
 }));
@@ -1181,13 +1196,11 @@ function looksLikeImage(b64) {
 // Set KEEP_ID_PHOTOS=true in Railway to keep ID photos after a decision.
 const KEEP_ID_PHOTOS = process.env.KEEP_ID_PHOTOS === 'true';
 
+// Sign-up creates a 'basic' (limited) account straight away. No ID number, ID
+// photos or selfie are collected here; those are submitted later through
+// POST /api/verification/upgrade to unlock the higher limits.
 app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req, res) => {
-   const {
-    username, password, pin, phoneNumber,
-    termsAccepted, governmentIdNumber,
-    governmentIdPhotoFrontBase64, governmentIdPhotoBackBase64, selfiePhotoBase64,
-    phoneVerificationToken,
-  } = req.body || {};
+  const { username, password, pin, phoneNumber, termsAccepted, phoneVerificationToken } = req.body || {};
 
   if (!username || !password || !pin || !phoneNumber) {
     return res.status(400).json({ error: 'username, password, pin, and phoneNumber are required' });
@@ -1199,7 +1212,6 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
     return res.status(400).json({ error: 'Username must be 3-30 characters: letters, numbers, spaces, . _ -' });
   }
   if (password.length > 72) return res.status(400).json({ error: 'Password must be 72 characters or fewer' });
-  // Same rules as the app's checklist: 8+ chars, a letter, a number, and one of @ * _ -
   if (password.length < 8 || !/[A-Za-z]/.test(password) || !/\d/.test(password) || !/[@*_-]/.test(password)) {
     return res.status(400).json({
       error: 'Password must be at least 8 characters and include a letter, a number, and one of @ * _ -',
@@ -1218,22 +1230,6 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
       return res.status(400).json({ error: 'Please verify your phone number with the code we text you' });
     }
   }
-  if (!governmentIdNumber || !governmentIdNumber.toString().trim()) {
-    return res.status(400).json({ error: 'A government-issued ID number is required' });
-  }
-  if (
-    !looksLikeImage(governmentIdPhotoFrontBase64) ||
-    !looksLikeImage(governmentIdPhotoBackBase64) ||
-    !looksLikeImage(selfiePhotoBase64)
-  ) {
-    return res.status(400).json({ error: 'The ID and selfie photos must be JPEG or PNG images under about 4 MB each' });
-  }
-  if (!governmentIdPhotoFrontBase64 || !governmentIdPhotoBackBase64 || !selfiePhotoBase64) {
-    return res.status(400).json({ error: 'Photos of the front and back of your ID, plus a live selfie, are required' });
-  }
-
-  // Same ID written differently ("ab-123 456" vs "AB123456") must count as one.
-  const normalizedId = governmentIdNumber.toString().toUpperCase().replace(/[\s-]/g, '');
 
   const conn = await pool.getConnection();
   try {
@@ -1248,76 +1244,6 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
       return res.status(409).json({ error: 'That phone number is already registered to an account' });
     }
 
-    const [existingId] = await conn.execute(
-      "SELECT id FROM users WHERE REPLACE(REPLACE(UPPER(government_id_number), ' ', ''), '-', '') = ?",
-      [normalizedId]
-    );
-    if (existingId.length > 0) {
-      return res.status(409).json({ error: 'That government ID is already registered to an account' });
-    }
-
-    // One face = one account: search the new selfie against every selfie
-    // already registered. Skipped (not blocked) if Face++ is unavailable.
-    let selfieFaceToken = null;
-    if (FACEPP_API_KEY && FACEPP_API_SECRET) {
-      try {
-        await ensureFaceSet();
-        selfieFaceToken = await detectFaceToken(selfiePhotoBase64);
-        const duplicateFace = await findDuplicateFace(selfieFaceToken);
-        if (duplicateFace) {
-          return res.status(409).json({ error: 'This face is already registered to another account' });
-        }
-      } catch (err) {
-        console.error('Duplicate-face check skipped:', err.message);
-        selfieFaceToken = null;
-      }
-    }
-
-    // Face match: compares the live selfie against the photo on the ID. This
-    // only confirms the selfie matches THIS ID photo; the duplicate-face search
-    // just above is what stops the same face registering under another account.
-    let confidence = null;
-    let verificationStatus = 'pending';
-    try {
-       const result = await compareFaces(governmentIdPhotoFrontBase64, selfiePhotoBase64);
-      confidence = result.confidence;
-      verificationStatus = result.matched ? 'approved' : 'pending';
-    } catch (err) {
-      // Face++ failure (bad image, no face detected, API error) does NOT
-      // block registration — it just leaves the account pending for an
-      // admin to review manually, same as a low-confidence score would.
-      console.error('Face comparison failed during registration:', err.message);
-      verificationStatus = 'pending';
-    }
-
-    // Only a sign-up confirmed with a real fingerprint touch may be approved
-    // automatically. Phones with just a screen lock, no lock, or a browser go
-    // to an admin even if the face matched. (This is what the app reports; a
-    // modified app could claim 'fingerprint', so it is a safeguard, not proof.)
-    const verificationMethod = typeof req.body?.verificationMethod === 'string' ? req.body.verificationMethod : 'none';
-    if (verificationMethod !== 'fingerprint' && verificationStatus === 'approved') {
-      verificationStatus = 'pending';
-    }
-    // The app sets this when the ID number had to be typed in, or the live
-    // selfie check was skipped after repeated misses. An admin reviews those
-    // photos by hand, whatever the face score says.
-    if (req.body?.needsManualReview === true && verificationStatus === 'approved') {
-      verificationStatus = 'pending';
-    }
-
-    // Informational only: this does not decide whether the account is approved.
-    // The current app has one `needsManualReview` flag for "typed ID or skipped
-    // liveness", so the conservative value is 'skipped'. Browser sign-up also
-    // has no real liveness step and reports verificationMethod 'web'.
-    const livenessSkipped =
-      req.body?.needsManualReview === true ||
-      req.body?.livenessSkipped === true ||
-      req.body?.skipped === true ||
-      req.body?.livenessPassed === false ||
-      req.body?.livenessStatus === 'skipped' ||
-      verificationMethod === 'web';
-    const livenessStatus = livenessSkipped ? 'skipped' : 'passed';
-
     const passwordHash = await bcrypt.hash(password, 10);
     const pinHash = await bcrypt.hash(pin, 10);
     const walletId = phoneNumber;
@@ -1325,45 +1251,22 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
     let result;
     try {
       [result] = await conn.execute(
-      `INSERT INTO users
-         (username, password_hash, pin_hash, wallet_id, balance, phone_number,
-          government_id_number, government_id_photo, government_id_photo_back, selfie_photo,
-          terms_accepted_at, verification_status, liveness_status, face_match_confidence)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?)`,
-      [
-        username, passwordHash, pinHash, walletId, 0, phoneNumber,
-        normalizedId, encryptPhoto(governmentIdPhotoFrontBase64), encryptPhoto(governmentIdPhotoBackBase64), encryptPhoto(selfiePhotoBase64),
-        verificationStatus, livenessStatus, confidence,
-      ]
-    );
+        `INSERT INTO users
+           (username, password_hash, pin_hash, wallet_id, balance, phone_number,
+            government_id_number, government_id_photo, government_id_photo_back, selfie_photo,
+            terms_accepted_at, verification_status, verification_level, liveness_status)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, '', '', '', NOW(), 'approved', 'basic', 'skipped')`,
+        [username, passwordHash, pinHash, walletId, 0, phoneNumber]
+      );
     } catch (err) {
-      // Two sign-ups racing each other can both pass the SELECT checks above;
-      // the database's UNIQUE keys (see sql/add_unique_constraints.sql) catch that.
       if (err.code === 'ER_DUP_ENTRY') {
         const m = err.sqlMessage || '';
         const msg = /phone|wallet/i.test(m)
           ? 'That phone number is already registered to an account'
-          : /government|gov_id/i.test(m)
-            ? 'That government ID is already registered to an account'
-            : 'That username is already taken';
+          : 'That username is already taken';
         return res.status(409).json({ error: msg });
       }
       throw err;
-    }
-
-    if (selfieFaceToken) {
-      try {
-        await addFaceToIndex(selfieFaceToken);
-      } catch (err) {
-        console.error('Could not add face to index:', err.message);
-      }
-    }
-
-    if (verificationStatus === 'approved' && !KEEP_ID_PHOTOS) {
-      await conn.execute(
-        "UPDATE users SET government_id_photo = '', government_id_photo_back = '', selfie_photo = '' WHERE id = ?",
-        [result.insertId]
-      );
     }
 
     await refreshUserInIndex(result.insertId);
@@ -1371,10 +1274,9 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
     res.json({
       ok: true,
       walletId,
-      verificationStatus,
-      message: verificationStatus === 'approved'
-        ? 'Account verified — you can log in now.'
-        : 'Account created. Your ID is pending verification by an admin before you can log in.',
+      verificationStatus: 'approved',
+      verificationLevel: 'basic',
+      message: 'Account created. You can log in now. Verify your ID in the app to unlock higher limits.',
     });
   } finally {
     conn.release();
@@ -1394,7 +1296,7 @@ app.post('/api/login', authLimiter, asyncRoute(async (req, res) => {
     return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedForSeconds} second(s).` });
   }
 
-        const [rows] = await pool.execute(
+  const [rows] = await pool.execute(
     'SELECT id, password_hash, status, verification_status FROM users WHERE username = ?',
     [username]
   );
@@ -1997,7 +1899,7 @@ app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
   // verification.level = 'fully_verified', so only pending/rejected map back
   // here (the requested upgradeStatus vocabulary is none | pending | rejected).
   const [[latestUpgrade]] = await pool.execute(
-    'SELECT status FROM verification_upgrades WHERE user_id = ? ORDER BY id DESC LIMIT 1',
+    'SELECT status, rejection_reason FROM verification_upgrades WHERE user_id = ? ORDER BY id DESC LIMIT 1',
     [req.userId]
   );
   const upgradeStatus =
@@ -2006,6 +1908,10 @@ app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
       : latestUpgrade && (latestUpgrade.status === 'pending' || latestUpgrade.status === 'rejected')
         ? latestUpgrade.status
         : 'none';
+  // Only a rejected request has a reason. It is plain review feedback, never an
+  // ID number or other sensitive document data.
+  const upgradeRejectionReason =
+    upgradeStatus === 'rejected' ? latestUpgrade.rejection_reason || null : null;
 
   // Both spellings are returned on purpose. The app reads `walletId` (it is
   // what /api/login and the device-login route send), and the client's
@@ -2022,13 +1928,16 @@ app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
       level: u.verification_level,
       livenessStatus: u.liveness_status,
       upgradeStatus,
+      rejectionReason: upgradeRejectionReason,
     },
   });
 }));
 
-// Post-login upgrade from 'verified' to 'fully_verified'. This never trusts
-// the client's liveness flag and never grants the level by itself: it only
-// creates a pending review row. An admin must approve it.
+// Post-login upgrade from 'basic' (or 'verified') to 'fully_verified'. This is
+// where the ID number, ID photos and selfie are collected now (they are no
+// longer part of sign-up). It never trusts the client's liveness flag and never
+// grants the level by itself: it only creates a pending review row. An admin
+// must approve it.
 // requireAuth, the verification limiter and the 35mb parser are mounted above
 // this route (before the global 100kb parser) so rejected requests are never
 // parsed. They must not be repeated here or the limiter would count twice.
@@ -2041,6 +1950,7 @@ app.post('/api/verification/upgrade', asyncRoute(async (req, res) => {
   const upgradeMethod = requestedMethod === 'guardian' ? 'guardian' : 'self';
 
   const {
+    governmentIdNumber: rawGovernmentIdNumber,
     governmentIdPhotoFrontBase64,
     governmentIdPhotoBackBase64,
     selfiePhotoBase64,
@@ -2054,6 +1964,8 @@ app.post('/api/verification/upgrade', asyncRoute(async (req, res) => {
   } = req.body || {};
 
   let guardianName = null;
+  let normalizedId = null;
+
   if (upgradeMethod === 'guardian') {
     if (
       !looksLikeImage(selfiePhotoBase64) ||
@@ -2085,8 +1997,13 @@ app.post('/api/verification/upgrade', asyncRoute(async (req, res) => {
     ) {
       return res.status(400).json({ error: 'The ID and selfie photos must be JPEG or PNG images under about 4 MB each' });
     }
-    if (!governmentIdPhotoFrontBase64 || !governmentIdPhotoBackBase64 || !selfiePhotoBase64) {
-      return res.status(400).json({ error: 'Photos of the front and back of your ID, plus a live selfie, are required' });
+    if (typeof rawGovernmentIdNumber !== 'string') {
+      return res.status(400).json({ error: 'A government ID number is required' });
+    }
+    // Same ID written differently ("ab-123 456" vs "AB123456") must count as one.
+    normalizedId = rawGovernmentIdNumber.toUpperCase().replace(/[\s-]/g, '');
+    if (!/^[A-Z0-9]{6,30}$/.test(normalizedId)) {
+      return res.status(400).json({ error: 'Enter a valid government ID number' });
     }
   }
 
@@ -2135,8 +2052,45 @@ app.post('/api/verification/upgrade', asyncRoute(async (req, res) => {
     return res.status(409).json({ error: 'You already have a verification upgrade waiting for review' });
   }
 
+  // One ID = one account, and one face = one account. Both used to be checked
+  // at sign-up; they now happen here, before an admin ever sees the request.
+  if (upgradeMethod === 'self') {
+    const [idTaken] = await pool.execute(
+      "SELECT id FROM users WHERE REPLACE(REPLACE(UPPER(government_id_number), ' ', ''), '-', '') = ? AND id <> ?",
+      [normalizedId, req.userId]
+    );
+    if (idTaken.length > 0) {
+      return res.status(409).json({ error: 'That government ID is already registered to an account' });
+    }
+    const [idPending] = await pool.execute(
+      "SELECT id FROM verification_upgrades WHERE government_id_number = ? AND status = 'pending' AND user_id <> ? LIMIT 1",
+      [normalizedId, req.userId]
+    );
+    if (idPending.length > 0) {
+      return res.status(409).json({ error: 'That government ID is already being verified on another account' });
+    }
+
+    // New basic accounts have never been indexed. Existing 'verified' accounts
+    // were already face-checked at sign-up, so re-checking them here would flag
+    // their own indexed face as a duplicate (the FaceSet has no user mapping).
+    if (user.verification_level === 'basic' && FACEPP_API_KEY && FACEPP_API_SECRET) {
+      let duplicateFace = null;
+      try {
+        await ensureFaceSet();
+        const faceToken = await detectFaceToken(selfiePhotoBase64);
+        duplicateFace = await findDuplicateFace(faceToken);
+      } catch (err) {
+        // Fail-open like before: a Face++ outage must not block the request.
+        console.error('Duplicate-face check skipped during upgrade:', err.message);
+      }
+      if (duplicateFace) {
+        return res.status(409).json({ error: 'This face is already registered to another account' });
+      }
+    }
+  }
+
   // Face++ only produces a score for the admin. A Face++ outage must not lose
-  // the request; the review is manual in that case, exactly like registration.
+  // the request; the review is manual in that case.
   // The guardian path compares the guardian ID front with the guardian live
   // photo; the birth certificate is deliberately not sent to Face++.
   let confidence = null;
@@ -2233,13 +2187,14 @@ app.post('/api/verification/upgrade', asyncRoute(async (req, res) => {
     } else {
       [result] = await conn.execute(
         `INSERT INTO verification_upgrades
-           (user_id, status, liveness_status, face_match_confidence,
+           (user_id, status, liveness_status, face_match_confidence, government_id_number,
             government_id_photo, government_id_photo_back, selfie_photo)
-         VALUES (?, 'pending', ?, ?, ?, ?, ?)`,
+         VALUES (?, 'pending', ?, ?, ?, ?, ?, ?)`,
         [
           req.userId,
           livenessStatus,
           confidence,
+          normalizedId,
           encryptedFront,
           encryptedBack,
           encryptedSelfie,
@@ -2739,7 +2694,7 @@ app.post('/api/requests/split', requireAuth, moneyLimiter, idempotent, asyncRout
 
 // ---------- account limits (shown in the app) ----------
 app.get('/api/limits', requireAuth, asyncRoute(async (req, res) => {
-  const level = req.verificationLevel === 'fully_verified' ? 'fully_verified' : 'verified';
+  const level = ['basic', 'fully_verified'].includes(req.verificationLevel) ? req.verificationLevel : 'verified';
   const limits = limitsForUser(level);
   const used = await spentInLast24h(pool, req.userId);
   res.json({
@@ -4450,7 +4405,7 @@ app.get('/api/admin/users', requireAdmin, asyncRoute(async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page) || 1);
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 50));
   const offset = (page - 1) * pageSize;
-    const search = req.query.search ? `%${req.query.search.toString().trim()}%` : null;
+  const search = req.query.search ? `%${req.query.search.toString().trim()}%` : null;
   const sortBy = req.query.sortBy === 'balance' ? 'balance' : 'username';
 
   // Matches on username OR the numeric ID (cast to text so a partial-ID
@@ -4466,8 +4421,8 @@ app.get('/api/admin/users', requireAdmin, asyncRoute(async (req, res) => {
   // DB does the heavy lifting (only pulls the rows for this page) — merge
   // sort still runs, just on the bounded page instead of the whole table,
   // so it stays fast at any scale while keeping the mandatory sort step.
-      const [rawUsers] = await pool.query(
-    `SELECT u.id, u.username, u.wallet_id AS walletId, u.balance, u.status,
+  const [rawUsers] = await pool.query(
+    `SELECT u.id, u.username, u.wallet_id AS walletId, u.balance, u.status, u.verification_level AS verificationLevel,
             (SELECT COUNT(*) FROM group_members gm WHERE gm.user_id = u.id) AS groupCount
      FROM users u
      ${whereClause}
@@ -4926,7 +4881,7 @@ app.post('/api/loans', requireAuth, asyncRoute(async (req, res) => {
     return res.status(400).json({ error: 'You already have a pending or active loan — repay or resolve it before applying again' });
   }
 
- const approvalsNeeded = approvalsNeededFor(amt);
+  const approvalsNeeded = approvalsNeededFor(amt);
   const [result] = await pool.execute(
     `INSERT INTO loans (user_id, loan_type, amount, purpose, term_months, applicant_age, government_id, legal_ack, approvals_needed)
      VALUES (?,?,?,?,?,?,?,?,?)`,
@@ -5237,6 +5192,11 @@ app.get('/api/routes/compare', requireAuth, (req, res) => {
 });
 
 // ---------- admin: identity verification review ----------
+//
+// Legacy sign-up review. New accounts no longer submit ID photos at sign-up (they
+// are 'approved' + 'basic' straight away), so this queue only holds accounts
+// created before that change. It is kept so those old pending accounts can
+// still be decided.
 
 app.get('/api/admin/verifications/pending', requireAdmin, asyncRoute(async (req, res) => {
   const [rows] = await pool.query(
@@ -5296,13 +5256,14 @@ app.post('/api/admin/verifications/:id/respond', requireAdmin, asyncRoute(async 
   res.json({ ok: true, status: approve ? 'approved' : 'rejected' });
 }));
 
-// Admin review for post-login upgrades. These are separate from the sign-up
-// review above: the account is already approved and can log in; only its
-// verification_level changes on approval.
+// Admin review for post-login upgrades. This is now THE verification queue for
+// new accounts: the account is already approved and can log in at the 'basic'
+// level; only its verification_level changes on approval.
 app.get('/api/admin/verification-upgrades/pending', requireAdmin, asyncRoute(async (req, res) => {
   const [rows] = await pool.query(
     `SELECT v.id, v.user_id AS userId, u.username, u.wallet_id AS walletId,
             v.upgrade_method AS upgradeMethod,
+            v.government_id_number AS governmentIdNumber,
             v.liveness_status AS livenessStatus,
             v.face_match_confidence AS faceMatchConfidence,
             v.guardian_name AS guardianName,
@@ -5339,14 +5300,18 @@ app.get('/api/admin/verification-upgrades/pending', requireAdmin, asyncRoute(asy
 app.post('/api/admin/verification-upgrades/:id/respond', requireAdmin, asyncRoute(async (req, res) => {
   const upgradeId = Number(req.params.id);
   const approve = !!req.body?.approve;
+  const rejectionReason = cleanText(req.body?.reason, 255);
   if (!Number.isInteger(upgradeId)) return res.status(400).json({ error: 'Invalid upgrade ID' });
+  if (!approve && !rejectionReason) {
+    return res.status(400).json({ error: 'A rejection reason is required' });
+  }
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
     const [[upgrade]] = await conn.query(
-      'SELECT id, user_id, status, liveness_status, upgrade_method FROM verification_upgrades WHERE id = ? FOR UPDATE',
+      'SELECT id, user_id, status, liveness_status, upgrade_method, government_id_number, selfie_photo FROM verification_upgrades WHERE id = ? FOR UPDATE',
       [upgradeId]
     );
     if (!upgrade) {
@@ -5375,11 +5340,45 @@ app.post('/api/admin/verification-upgrades/:id/respond', requireAdmin, asyncRout
       return res.status(409).json({ error: 'This account is already fully verified' });
     }
 
+    // Keep the selfie in memory: the photos may be wiped below, and the
+    // Face++ index needs it after the commit. Re-check only for accounts that
+    // started as 'basic': legacy 'verified' faces are already in the FaceSet
+    // and would otherwise match themselves (the set has no user mapping).
+    const selfieForIndex =
+      approve && upgrade.upgrade_method === 'self' ? decryptPhoto(upgrade.selfie_photo) : null;
+    let faceTokenForIndex = null;
+    if (
+      approve &&
+      selfieForIndex &&
+      user.verification_level === 'basic' &&
+      FACEPP_API_KEY &&
+      FACEPP_API_SECRET
+    ) {
+      try {
+        await ensureFaceSet();
+        faceTokenForIndex = await detectFaceToken(selfieForIndex);
+        const duplicateFace = await findDuplicateFace(faceTokenForIndex);
+        if (duplicateFace) {
+          await conn.rollback();
+          return res.status(409).json({ error: 'This face is already registered to another account' });
+        }
+      } catch (err) {
+        // A Face++ outage must not block a manual review.
+        faceTokenForIndex = null;
+        console.error('Duplicate-face check skipped during upgrade approval:', err.message);
+      }
+    }
+
     // The pending predicate is in the WHERE clause as well as the locked row,
     // so two admins racing on the same request cannot both decide it.
     const [decision] = await conn.execute(
-      "UPDATE verification_upgrades SET status = ?, reviewed_at = NOW(), reviewed_by = ? WHERE id = ? AND status = 'pending'",
-      [approve ? 'approved' : 'rejected', req.adminId, upgradeId]
+      "UPDATE verification_upgrades SET status = ?, rejection_reason = ?, reviewed_at = NOW(), reviewed_by = ? WHERE id = ? AND status = 'pending'",
+      [
+        approve ? 'approved' : 'rejected',
+        approve ? null : rejectionReason || null,
+        req.adminId,
+        upgradeId,
+      ]
     );
     if (decision.affectedRows === 0) {
       await conn.rollback();
@@ -5387,10 +5386,27 @@ app.post('/api/admin/verification-upgrades/:id/respond', requireAdmin, asyncRout
     }
 
     if (approve) {
-      await conn.execute(
-        "UPDATE users SET verification_level = 'fully_verified', liveness_status = ? WHERE id = ?",
-        [upgrade.liveness_status, upgrade.user_id]
-      );
+      try {
+        if (upgrade.upgrade_method === 'self' && upgrade.government_id_number) {
+          // The ID number goes onto the user only now, so the UNIQUE key on
+          // users.government_id_number enforces one ID = one account.
+          await conn.execute(
+            "UPDATE users SET verification_level = 'fully_verified', liveness_status = ?, government_id_number = ? WHERE id = ?",
+            [upgrade.liveness_status, upgrade.government_id_number, upgrade.user_id]
+          );
+        } else {
+          await conn.execute(
+            "UPDATE users SET verification_level = 'fully_verified', liveness_status = ? WHERE id = ?",
+            [upgrade.liveness_status, upgrade.user_id]
+          );
+        }
+      } catch (err) {
+        if (err.code === 'ER_DUP_ENTRY') {
+          await conn.rollback();
+          return res.status(409).json({ error: 'That government ID is already registered to another account' });
+        }
+        throw err;
+      }
     }
 
     // Photos are only needed for this review. Delete them once decided, exactly
@@ -5403,6 +5419,19 @@ app.post('/api/admin/verification-upgrades/:id/respond', requireAdmin, asyncRout
     }
 
     await conn.commit();
+
+    // Best effort, after the commit: add this face to the duplicate-face index
+    // so nobody else can register or upgrade with it. A Face++ failure must
+    // not undo an approval that is already saved. The token is reused from the
+    // pre-commit check; legacy faces are already indexed and are not re-added.
+    if (faceTokenForIndex) {
+      try {
+        await addFaceToIndex(faceTokenForIndex);
+      } catch (err) {
+        console.error('Could not add face to index after upgrade approval:', err.message);
+      }
+    }
+
     await refreshUserInIndex(upgrade.user_id);
     await logAdmin(
       req,
@@ -5698,4 +5727,11 @@ const port = process.env.PORT || 3000;
   process.exit(1);
 });
 
-// ---------- provider network simulation and DB migration notes below are unchanged ----------
+// ---------- DB MIGRATION NOTES ----------
+//
+// Run once before deploying this version:
+//   migrations/2026-10-29_basic_verification.sql
+// It adds 'basic' to users.verification_level, adds government_id_number and
+// rejection_reason to verification_upgrades, indexes the pending-ID lookup, and
+// makes users.government_id_number nullable for new sign-ups. It does not
+// backfill or change any existing account's level.
