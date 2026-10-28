@@ -665,6 +665,20 @@ async function requireAuth(req, res, next) {
   }
 }
 
+// Gate for features that new 'basic' accounts cannot use yet. Legacy 'verified'
+// accounts keep the access they already had; only 'basic' is blocked. The level
+// comes from the users row requireAuth reloads on every request (never from the
+// JWT), so an approved upgrade takes effect without forcing a new login.
+function requireVerifiedAccount(req, res, next) {
+  if (req.verificationLevel === 'basic') {
+    return res.status(403).json({
+      error: 'Verify your identity to use loans, savings, and groups.',
+      code: 'verification_required',
+    });
+  }
+  next();
+}
+
 // ---------- extra hardening helpers ----------
 // Per-user cap on money actions, so one login can't hammer send/pay/load/bills
 // (or guess which numbers are registered through "recipient not found").
@@ -3333,7 +3347,7 @@ app.post('/api/budget', requireAuth, asyncRoute(async (req, res) => {
   res.json({ ok: true, monthlyBudgetCentavos: centavos });
 }));
 
-app.get('/api/groups/mine', requireAuth, asyncRoute(async (req, res) => {
+app.get('/api/groups/mine', requireAuth, requireVerifiedAccount, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute(
     `SELECT g.id, g.name, g.balance,
             (SELECT COUNT(*) FROM group_members gm2 WHERE gm2.group_id = g.id) AS memberCount
@@ -3345,7 +3359,7 @@ app.get('/api/groups/mine', requireAuth, asyncRoute(async (req, res) => {
   res.json(rows.map((g) => ({ ...g, balance: toCentavos(g.balance) })));
 }));
 
-app.get('/api/groups', requireAuth, asyncRoute(async (req, res) => {
+app.get('/api/groups', requireAuth, requireVerifiedAccount, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute(
     `SELECT g.id, g.name, g.balance,
             (SELECT COUNT(*) FROM group_members gm2 WHERE gm2.group_id = g.id) AS memberCount
@@ -3369,7 +3383,7 @@ async function requireGroupMembership(groupId, userId) {
   return !!membership;
 }
 
-app.get('/api/groups/:id', requireAuth, asyncRoute(async (req, res) => {
+app.get('/api/groups/:id', requireAuth, requireVerifiedAccount, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   if (!Number.isInteger(groupId)) {
     return res.status(400).json({ error: 'Invalid group ID' });
@@ -3388,7 +3402,7 @@ app.get('/api/groups/:id', requireAuth, asyncRoute(async (req, res) => {
   res.json({ id: group.id, name: group.name, balance: toCentavos(group.balance), members });
 }));
 
-app.get('/api/groups/:id/transactions', requireAuth, asyncRoute(async (req, res) => {
+app.get('/api/groups/:id/transactions', requireAuth, requireVerifiedAccount, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   if (!Number.isInteger(groupId)) {
     return res.status(400).json({ error: 'Invalid group ID' });
@@ -3406,7 +3420,7 @@ app.get('/api/groups/:id/transactions', requireAuth, asyncRoute(async (req, res)
   res.json(rows.map((row) => ({ ...row, amount: toCentavos(row.amount) })));
 }));
 
-app.get('/api/groups/:id/requests', requireAuth, asyncRoute(async (req, res) => {
+app.get('/api/groups/:id/requests', requireAuth, requireVerifiedAccount, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   if (!(await requireGroupMembership(groupId, req.userId))) {
     return res.status(403).json({ error: 'Not a member of this group' });
@@ -3421,7 +3435,7 @@ app.get('/api/groups/:id/requests', requireAuth, asyncRoute(async (req, res) => 
   res.json(rows.map((row) => ({ ...row, amount: toCentavos(row.amount) })));
 }));
 
-app.post('/api/groups/:id/withdraw-requests', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/groups/:id/withdraw-requests', requireAuth, requireVerifiedAccount, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   const amt = parseCentavos(req.body?.amountCentavos);
   const reason = cleanText(req.body?.reason, 255) || '';
@@ -3466,7 +3480,7 @@ app.post('/api/groups/:id/withdraw-requests', requireAuth, asyncRoute(async (req
   }
 }));
 
-app.get('/api/groups/:id/withdraw-requests', requireAuth, asyncRoute(async (req, res) => {
+app.get('/api/groups/:id/withdraw-requests', requireAuth, requireVerifiedAccount, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
 
   const [[membership]] = await pool.query(
@@ -3492,7 +3506,7 @@ app.get('/api/groups/:id/withdraw-requests', requireAuth, asyncRoute(async (req,
 }));
 // ---------- groups (capped at MAX_GROUP_MEMBERS) ----------
 
-app.post('/api/groups', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/groups', requireAuth, requireVerifiedAccount, asyncRoute(async (req, res) => {
   const name = cleanText(req.body?.name, 100);
   if (!name) return res.status(400).json({ error: 'name is required' });
 
@@ -3511,7 +3525,7 @@ app.post('/api/groups', requireAuth, asyncRoute(async (req, res) => {
   }
 }));
 
-app.post('/api/groups/:id/request-join', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/groups/:id/request-join', requireAuth, requireVerifiedAccount, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
 
   const [[already]] = await pool.query(
@@ -3533,7 +3547,7 @@ app.post('/api/groups/:id/request-join', requireAuth, asyncRoute(async (req, res
   res.json({ ok: true });
 }));
 
-app.get('/api/groups/:id/join-requests', requireAuth, asyncRoute(async (req, res) => {
+app.get('/api/groups/:id/join-requests', requireAuth, requireVerifiedAccount, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   const [[membership]] = await pool.query(
     'SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?',
@@ -3550,7 +3564,7 @@ app.get('/api/groups/:id/join-requests', requireAuth, asyncRoute(async (req, res
   res.json(rows);
 }));
 
-app.post('/api/groups/:groupId/join-requests/:reqId/respond', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/groups/:groupId/join-requests/:reqId/respond', requireAuth, requireVerifiedAccount, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.groupId);
   const reqId = Number(req.params.reqId);
   const approve = !!req.body?.approve;
@@ -3607,7 +3621,7 @@ app.post('/api/groups/:groupId/join-requests/:reqId/respond', requireAuth, async
   }
 }));
 
-app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
+app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, requireVerifiedAccount, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.groupId);
   const reqId = Number(req.params.reqId);
   const approve = !!req.body?.approve;
@@ -3751,7 +3765,7 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, m
   }
 }));
 
-app.post('/api/groups/:id/contribute', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
+app.post('/api/groups/:id/contribute', requireAuth, requireVerifiedAccount, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   const amt = parseCentavos(req.body?.amountCentavos);
   if (amt === null) return res.status(400).json({ error: 'A positive amount (integer centavos) is required' });
@@ -3818,7 +3832,7 @@ app.post('/api/groups/:id/contribute', requireAuth, moneyLimiter, idempotent, re
   }
 }));
 
-app.post('/api/groups/:id/requests', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/groups/:id/requests', requireAuth, requireVerifiedAccount, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   const requesterName = cleanText(req.body?.requesterName, 100);
   const reason = cleanText(req.body?.reason, 255);
@@ -3844,7 +3858,7 @@ app.post('/api/groups/:id/requests', requireAuth, asyncRoute(async (req, res) =>
 
 // ---------- savings goals (personal, locked sub-balance) ----------
 
-app.post('/api/savings', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/savings', requireAuth, requireVerifiedAccount, asyncRoute(async (req, res) => {
   const name = cleanText(req.body?.name, 100);
   const target = parseCentavos(req.body?.targetAmountCentavos);
   if (!name) return res.status(400).json({ error: 'A goal name is required' });
@@ -3857,7 +3871,7 @@ app.post('/api/savings', requireAuth, asyncRoute(async (req, res) => {
   res.json({ id: result.insertId, ok: true });
 }));
 
-app.get('/api/savings/mine', requireAuth, asyncRoute(async (req, res) => {
+app.get('/api/savings/mine', requireAuth, requireVerifiedAccount, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute(
     'SELECT id, name, target_amount, saved_amount, status, created_at FROM savings_goals WHERE user_id = ? ORDER BY created_at DESC',
     [req.userId]
@@ -3869,7 +3883,7 @@ app.get('/api/savings/mine', requireAuth, asyncRoute(async (req, res) => {
   })));
 }));
 
-app.post('/api/savings/:id/deposit', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
+app.post('/api/savings/:id/deposit', requireAuth, requireVerifiedAccount, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const goalId = Number(req.params.id);
   const amt = parseCentavos(req.body?.amountCentavos);
   if (amt === null) return res.status(400).json({ error: 'A positive amount (integer centavos) is required' });
@@ -3921,7 +3935,7 @@ app.post('/api/savings/:id/deposit', requireAuth, moneyLimiter, idempotent, requ
   }
 }));
 
-app.post('/api/savings/:id/withdraw', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
+app.post('/api/savings/:id/withdraw', requireAuth, requireVerifiedAccount, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const goalId = Number(req.params.id);
   const amt = parseCentavos(req.body?.amountCentavos);
   if (amt === null) return res.status(400).json({ error: 'A positive amount (integer centavos) is required' });
@@ -3973,7 +3987,7 @@ app.post('/api/savings/:id/withdraw', requireAuth, moneyLimiter, idempotent, req
   }
 }));
 
-app.delete('/api/savings/:id', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
+app.delete('/api/savings/:id', requireAuth, requireVerifiedAccount, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const goalId = Number(req.params.id);
   const conn = await pool.getConnection();
   try {
@@ -4844,7 +4858,7 @@ function approvalsNeededFor(amountCentavos) {
   return 3;
 }
 
-app.post('/api/loans', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/loans', requireAuth, requireVerifiedAccount, asyncRoute(async (req, res) => {
   const { loanType, amountCentavos, purpose, termMonths, age, governmentId, legalAck } = req.body || {};
   const amt = parseCentavos(amountCentavos);
   const term = Number(termMonths);
@@ -4903,7 +4917,7 @@ app.post('/api/loans', requireAuth, asyncRoute(async (req, res) => {
   res.json({ id: result.insertId, ok: true, approvalsNeeded });
 }));
 
-app.get('/api/loans/mine', requireAuth, asyncRoute(async (req, res) => {
+app.get('/api/loans/mine', requireAuth, requireVerifiedAccount, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute(
     `SELECT l.id, l.loan_type AS loanType, l.amount, l.purpose, l.term_months AS termMonths, l.status,
             l.applicant_age AS applicantAge, l.government_id AS governmentId,
@@ -4915,7 +4929,7 @@ app.get('/api/loans/mine', requireAuth, asyncRoute(async (req, res) => {
   res.json(rows.map((l) => ({ ...l, amount: toCentavos(l.amount), amountRepaid: toCentavos(l.amountRepaid) })));
 }));
 
-app.post('/api/loans/:id/repay', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
+app.post('/api/loans/:id/repay', requireAuth, requireVerifiedAccount, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
   const loanId = Number(req.params.id);
   const amt = parseCentavos(req.body?.amountCentavos);
   if (amt === null) return res.status(400).json({ error: 'A positive repayment amount (integer centavos) is required' });
