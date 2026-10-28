@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS users (
   selfie_photo LONGTEXT NULL,
   terms_accepted_at TIMESTAMP NULL,
   verification_status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
-  verification_level ENUM('verified','fully_verified') NOT NULL DEFAULT 'verified',
+  verification_level ENUM('basic','verified','fully_verified') NOT NULL DEFAULT 'verified',
   liveness_status ENUM('not_done','passed','skipped') NOT NULL DEFAULT 'not_done',
   face_match_confidence DOUBLE NULL,
   status ENUM('active','suspended') NOT NULL DEFAULT 'active',
@@ -276,10 +276,11 @@ CREATE TABLE IF NOT EXISTS admin_audit_log (
   KEY idx_audit_target (target_type, target_id)
 ) ENGINE=InnoDB;
 
--- ---------- verification upgrades (verified -> fully_verified) ----------
+-- ---------- verification upgrades (basic/verified -> fully_verified) ----------
 -- The account-level verification_status above is still the login gate. This
 -- table only holds post-login upgrade requests; an admin decision is what
--- grants verification_level = 'fully_verified'.
+-- grants verification_level = 'fully_verified'. New accounts start as 'basic';
+-- existing accounts keep whatever level they already have.
 CREATE TABLE IF NOT EXISTS verification_upgrades (
   id INT AUTO_INCREMENT PRIMARY KEY,
   user_id INT NOT NULL,
@@ -290,6 +291,7 @@ CREATE TABLE IF NOT EXISTS verification_upgrades (
   government_id_photo_back LONGTEXT NULL,
   selfie_photo LONGTEXT NULL,
   upgrade_method ENUM('self','guardian') NOT NULL DEFAULT 'self',
+  government_id_number VARCHAR(64) NULL,
   guardian_name VARCHAR(100) NULL,
   guardian_relationship ENUM('parent','legal_guardian') NULL,
   guardian_photo LONGTEXT NULL,
@@ -301,7 +303,9 @@ CREATE TABLE IF NOT EXISTS verification_upgrades (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   reviewed_at TIMESTAMP NULL,
   reviewed_by INT NULL,
+  rejection_reason VARCHAR(255) NULL,
   KEY idx_verification_upgrades_user_status (user_id, status),
+  KEY idx_verification_upgrades_gov_id (government_id_number, status),
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
   FOREIGN KEY (reviewed_by) REFERENCES admins(id) ON DELETE SET NULL
 ) ENGINE=InnoDB;
