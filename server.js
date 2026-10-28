@@ -2132,12 +2132,13 @@ app.post('/api/verification/upgrade', asyncRoute(async (req, res) => {
 // ID itself, which is text whoever printed the QR chose, so a fake shop QR
 // gives the payer nothing to check against.
 //
-// A Wallet ID is PCST- plus six digits, so the whole space is about a million
-// values: this route is an enumeration target and is rate limited per user for
-// that reason. Unknown, inactive and suspended accounts all answer with the
-// same 404, so it cannot be used to discover which IDs exist or whether one is
-// suspended. Only the two columns below are ever selected, and nothing is
-// logged - not the Wallet ID, not the username.
+// A wallet ID is the account's 11-digit mobile number (09xxxxxxxxx), and older
+// accounts may still have a PCST-123456 style ID, so both shapes are accepted.
+// The space is small enough that this route is an enumeration target and is
+// rate limited per user for that reason. Unknown, inactive and suspended
+// accounts all answer with the same 404, so it cannot be used to discover which
+// IDs exist or whether one is suspended. Only the two columns below are ever
+// selected, and nothing is logged - not the Wallet ID, not the username.
 //
 // The caller's own Wallet ID answers 200 with their own name: requireAuth has
 // already rejected a suspended caller, and the app blocks paying yourself
@@ -2154,10 +2155,10 @@ const walletLookupLimiter = rateLimit({
 
 app.get('/api/wallet/lookup', requireAuth, walletLookupLimiter, asyncRoute(async (req, res) => {
   const walletId = String(req.query?.walletId || '').trim().toUpperCase();
-  // Same shape the app's QR scanner accepts. Rejected before the query runs, so
+  // Same shapes the app's QR scanner accepts. Rejected before the query runs, so
   // a malformed value never reaches the database.
-  if (!/^PCST-\d{6}$/.test(walletId)) {
-    return res.status(400).json({ error: 'Enter a Wallet ID in the form PCST-123456' });
+  if (!/^(PCST-\d{6}|09\d{9})$/.test(walletId)) {
+    return res.status(400).json({ error: 'Enter a valid Wallet ID (11-digit mobile number or PCST-123456)' });
   }
 
   const [[row]] = await pool.execute(
