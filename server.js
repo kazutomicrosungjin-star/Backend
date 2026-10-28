@@ -1651,14 +1651,18 @@ app.post('/api/auth/change-pin', requireAuth, pinLimiter, asyncRoute(async (req,
 // request/reset flow.
 //
 // Codes are 6 digits, stored only as an HMAC-SHA256 hex digest bound to the
-// user id, valid for 10 minutes, and dead on first use, after 5 wrong tries,
-// or at expiry. The PIN is never touched here.
+// user id AND purpose, valid for 10 minutes, and dead on first use, after 5
+// wrong tries, or at expiry. Binding the purpose into the digest means a
+// password code can never verify as a PIN code even if both happen to be the
+// same six digits.
 const RESET_CODE_TTL_SECONDS = 10 * 60;
 const RESET_MAX_ATTEMPTS = 5;
+const RESET_PURPOSES = new Set(['password', 'pin']);
 
-function hashResetCode(userId, code) {
+function hashResetCode(userId, code, purpose) {
+  if (!RESET_PURPOSES.has(purpose)) throw new Error('Invalid reset purpose');
   return crypto.createHmac('sha256', JWT_SECRET)
-    .update(`reset:${userId}:${code}`)
+    .update(`reset:${purpose}:${userId}:${code}`)
     .digest('hex');
 }
 
@@ -1669,17 +1673,19 @@ async function deliverResetCode(user, code) {
   return 'admin';
 }
 
-async function issueResetCode(user) {
+async function issueResetCode(user, purpose) {
+  if (!RESET_PURPOSES.has(purpose)) throw new Error('Invalid reset purpose');
   const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
-  // One live code per account: older unused codes stop working immediately.
+  // One live code per account per purpose: older unused codes of the same
+  // purpose stop working immediately. Other purposes are untouched.
   await pool.execute(
-    'UPDATE password_resets SET used_at = NOW() WHERE user_id = ? AND used_at IS NULL',
-    [user.id]
+    'UPDATE password_resets SET used_at = NOW() WHERE user_id = ? AND purpose = ? AND used_at IS NULL',
+    [user.id, purpose]
   );
   await pool.execute(
-    `INSERT INTO password_resets (user_id, code_hash, expires_at)
-     VALUES (?, ?, NOW() + INTERVAL ${RESET_CODE_TTL_SECONDS} SECOND)`,
-    [user.id, hashResetCode(user.id, code)]
+    `INSERT INTO password_resets (user_id, purpose, code_hash, expires_at)
+     VALUES (?, ?, ?, NOW() + INTERVAL ${RESET_CODE_TTL_SECONDS} SECOND)`,
+    [user.id, purpose, hashResetCode(user.id, code, purpose)]
   );
   return code;
 }
@@ -1704,6 +1710,21 @@ const resetIdentifierLimiter = rateLimit({
     const raw = String(req.body?.identifier || '').trim().toUpperCase();
     const identifier = normalizePhone(raw) || raw;
     return identifier ? `pwreset:${identifier}` : ipKeyGenerator(req);
+  },
+  message: { error: 'Too many attempts. Please try again later.' },
+});
+
+// /api/auth/reset-pin has no identifier in its body: the account is named by
+// the password-verified pending token. Key the per-account bucket off that
+// token's uid, and fall back to IP for an invalid/expired token.
+const pinResetAccountLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const payload = req.body?.pendingToken && verify(req.body.pendingToken);
+    return payload?.uid ? `pinreset:${payload.uid}` : ipKeyGenerator(req);
   },
   message: { error: 'Too many attempts. Please try again later.' },
 });
@@ -1738,7 +1759,7 @@ app.post('/api/auth/forgot-password', resetIpLimiter, resetIdentifierLimiter, as
 
   const user = await findResetUser(identifier);
   if (user) {
-    const code = await issueResetCode(user);
+    const code = await issueResetCode(user, 'password');
     await deliverResetCode(user, code);
   }
   res.json(generic);
@@ -1771,7 +1792,7 @@ app.post('/api/auth/reset-password', resetIpLimiter, resetIdentifierLimiter, asy
   const [[row]] = await pool.execute(
     `SELECT id, code_hash, attempts, (expires_at < NOW()) AS expired
        FROM password_resets
-      WHERE user_id = ? AND used_at IS NULL
+      WHERE user_id = ? AND purpose = 'password' AND used_at IS NULL
       ORDER BY id DESC
       LIMIT 1`,
     [user.id]
@@ -1780,13 +1801,13 @@ app.post('/api/auth/reset-password', resetIpLimiter, resetIdentifierLimiter, asy
   if (row.expired || row.attempts >= RESET_MAX_ATTEMPTS) {
     // Expired or already burned: make sure it can never be used later.
     await pool.execute(
-      'UPDATE password_resets SET used_at = NOW() WHERE id = ? AND used_at IS NULL',
+      "UPDATE password_resets SET used_at = NOW() WHERE id = ? AND purpose = 'password' AND used_at IS NULL",
       [row.id]
     );
     return res.status(400).json(invalidCode);
   }
 
-  const given = Buffer.from(hashResetCode(user.id, code), 'hex');
+  const given = Buffer.from(hashResetCode(user.id, code, 'password'), 'hex');
   const real = Buffer.from(row.code_hash, 'hex');
   if (given.length !== real.length || !crypto.timingSafeEqual(given, real)) {
     // Atomic increment: the 5th wrong try kills the code in the same statement.
@@ -1794,7 +1815,7 @@ app.post('/api/auth/reset-password', resetIpLimiter, resetIdentifierLimiter, asy
       `UPDATE password_resets
           SET attempts = attempts + 1,
               used_at = IF(attempts + 1 >= ${RESET_MAX_ATTEMPTS}, NOW(), used_at)
-        WHERE id = ? AND used_at IS NULL`,
+        WHERE id = ? AND purpose = 'password' AND used_at IS NULL`,
       [row.id]
     );
     return res.status(400).json(invalidCode);
@@ -1806,7 +1827,7 @@ app.post('/api/auth/reset-password', resetIpLimiter, resetIdentifierLimiter, asy
     await conn.beginTransaction();
     // Claim the code first: two requests racing on the same code cannot both win.
     const [claimed] = await conn.execute(
-      'UPDATE password_resets SET used_at = NOW() WHERE id = ? AND used_at IS NULL',
+      "UPDATE password_resets SET used_at = NOW() WHERE id = ? AND purpose = 'password' AND used_at IS NULL",
       [row.id]
     );
     if (claimed.affectedRows !== 1) {
@@ -1820,9 +1841,10 @@ app.post('/api/auth/reset-password', resetIpLimiter, resetIdentifierLimiter, asy
     // Same session invalidation as /api/auth/revoke-all: live tokens carry the
     // old `sv`, and enrolled fingerprint devices are dropped.
     await conn.execute('DELETE FROM device_tokens WHERE user_id = ?', [user.id]);
-    // Any other unused code for this account is dead too.
+    // Any other unused PASSWORD code for this account is dead too. PIN reset
+    // codes are a separate channel and are not consumed by a password reset.
     await conn.execute(
-      'UPDATE password_resets SET used_at = NOW() WHERE user_id = ? AND used_at IS NULL',
+      "UPDATE password_resets SET used_at = NOW() WHERE user_id = ? AND purpose = 'password' AND used_at IS NULL",
       [user.id]
     );
     await conn.commit();
@@ -1835,6 +1857,116 @@ app.post('/api/auth/reset-password', resetIpLimiter, resetIdentifierLimiter, asy
 
   await refreshUserInIndex(user.id);
   res.json({ ok: true, message: 'Password updated. Log in with your new password.' });
+}));
+
+// PIN recovery reuses the password-verified pending token from /api/login as
+// the identity proof. The admin-issued code is bound to purpose 'pin', so a
+// password-reset code cannot be replayed here (and vice versa).
+app.post('/api/auth/reset-pin', resetIpLimiter, pinResetAccountLimiter, asyncRoute(async (req, res) => {
+  const { pendingToken, code, newPin } = req.body || {};
+  const payload = pendingToken && verify(pendingToken);
+  if (!payload || payload.stage !== 'pending' || payload.role !== 'user') {
+    return res.status(401).json({ error: 'Login session expired, please log in again' });
+  }
+
+  // One message for "no live code", "expired", "used", "too many tries" and
+  // "wrong code" so this endpoint cannot be used to probe account state.
+  const invalidCode = { error: 'That code is invalid or has expired. Please request a new one.' };
+  if (typeof code !== 'string' || !/^\d{6}$/.test(code)) {
+    return res.status(400).json(invalidCode);
+  }
+  // Same rule as /api/register and /api/auth/change-pin.
+  if (typeof newPin !== 'string' || !/^\d{4}$/.test(newPin)) {
+    return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
+  }
+
+  const [[user]] = await pool.execute(
+    'SELECT id, pin_hash, status FROM users WHERE id = ?',
+    [payload.uid]
+  );
+  if (!user) return res.status(400).json(invalidCode);
+  if (user.status === 'suspended') {
+    return res.status(403).json({ error: 'This account has been suspended. Contact support for assistance.' });
+  }
+
+  const [[row]] = await pool.execute(
+    `SELECT id, code_hash, attempts, (expires_at < NOW()) AS expired
+       FROM password_resets
+      WHERE user_id = ? AND purpose = 'pin' AND used_at IS NULL
+      ORDER BY id DESC
+      LIMIT 1`,
+    [user.id]
+  );
+  if (!row) return res.status(400).json(invalidCode);
+  if (row.expired || row.attempts >= RESET_MAX_ATTEMPTS) {
+    // Expired or already burned: make sure it can never be used later.
+    await pool.execute(
+      "UPDATE password_resets SET used_at = NOW() WHERE id = ? AND purpose = 'pin' AND used_at IS NULL",
+      [row.id]
+    );
+    return res.status(400).json(invalidCode);
+  }
+
+  const given = Buffer.from(hashResetCode(user.id, code, 'pin'), 'hex');
+  const real = Buffer.from(row.code_hash, 'hex');
+  if (given.length !== real.length || !crypto.timingSafeEqual(given, real)) {
+    // Atomic increment: the 5th wrong try kills the code in the same statement.
+    await pool.execute(
+      `UPDATE password_resets
+          SET attempts = attempts + 1,
+              used_at = IF(attempts + 1 >= ${RESET_MAX_ATTEMPTS}, NOW(), used_at)
+        WHERE id = ? AND purpose = 'pin' AND used_at IS NULL`,
+      [row.id]
+    );
+    return res.status(400).json(invalidCode);
+  }
+
+  // Same rule as /api/auth/change-pin, checked without returning either PIN or
+  // its hash. The code stays live if this rule rejects the request.
+  if (await bcrypt.compare(newPin, user.pin_hash)) {
+    return res.status(400).json({ error: 'The new PIN must be different from the old PIN' });
+  }
+
+  const pinHash = await bcrypt.hash(newPin, 10);
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    // Claim the code first: two requests racing on the same PIN code cannot
+    // both win, even if both already passed the hash comparison.
+    const [claimed] = await conn.execute(
+      "UPDATE password_resets SET used_at = NOW() WHERE id = ? AND purpose = 'pin' AND used_at IS NULL",
+      [row.id]
+    );
+    if (claimed.affectedRows !== 1) {
+      await conn.rollback();
+      return res.status(400).json(invalidCode);
+    }
+    await conn.execute(
+      'UPDATE users SET pin_hash = ?, session_version = session_version + 1 WHERE id = ?',
+      [pinHash, user.id]
+    );
+    // Same session invalidation as a password reset: live tokens carry the old
+    // `sv`, and enrolled fingerprint devices are dropped.
+    await conn.execute('DELETE FROM device_tokens WHERE user_id = ?', [user.id]);
+    // Any other unused PIN code is dead too. Password codes are separate.
+    await conn.execute(
+      "UPDATE password_resets SET used_at = NOW() WHERE user_id = ? AND purpose = 'pin' AND used_at IS NULL",
+      [user.id]
+    );
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+
+  // The password proof plus admin code is a successful identity check, so
+  // clear any PIN lockout left by earlier wrong attempts. Lockout state lives
+  // in login_attempts; there is no per-user failed-attempt column to update.
+  await clearAttempts(`pin:${user.id}`);
+  await refreshUserInIndex(user.id);
+  res.json({ ok: true, message: 'PIN updated. Log in with your new password and new PIN.' });
 }));
 
 // The fingerprint phones enrolled on this account. Only metadata leaves the
@@ -4397,9 +4529,28 @@ app.post('/api/admin/users/:id/password-reset', requireAdmin, asyncRoute(async (
   );
   if (!user) return res.status(404).json({ error: 'User not found' });
 
-  const code = await issueResetCode(user);
+  const code = await issueResetCode(user, 'password');
   await deliverResetCode(user, code);
   await logAdmin(req, 'issue_password_reset', 'user', userId);
+  res.json({ ok: true, code, expiresInSeconds: RESET_CODE_TTL_SECONDS });
+}));
+
+app.post('/api/admin/users/:id/pin-reset', requireAdmin, asyncRoute(async (req, res) => {
+  const userId = Number(req.params.id);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ error: 'Invalid user ID' });
+  }
+
+  const [[user]] = await pool.query(
+    'SELECT id, username, phone_number, wallet_id FROM users WHERE id = ?',
+    [userId]
+  );
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  const code = await issueResetCode(user, 'pin');
+  await deliverResetCode(user, code);
+  // The audit row records the action, never the code itself.
+  await logAdmin(req, 'issue_pin_reset', 'user', userId);
   res.json({ ok: true, code, expiresInSeconds: RESET_CODE_TTL_SECONDS });
 }));
 
