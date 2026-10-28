@@ -1610,6 +1610,198 @@ app.post('/api/auth/change-pin', requireAuth, pinLimiter, asyncRoute(async (req,
   }
 }));
 
+// ---------- password recovery ----------
+//
+// This deployment has no email column and no mail provider, so recovery is
+// admin-assisted: the admin route below issues the code and returns it to the
+// authenticated admin, who hands it to the user out of band. Delivery sits
+// behind deliverResetCode() so SMS can be added later without touching the
+// request/reset flow.
+//
+// Codes are 6 digits, stored only as an HMAC-SHA256 hex digest bound to the
+// user id, valid for 10 minutes, and dead on first use, after 5 wrong tries,
+// or at expiry. The PIN is never touched here.
+const RESET_CODE_TTL_SECONDS = 10 * 60;
+const RESET_MAX_ATTEMPTS = 5;
+
+function hashResetCode(userId, code) {
+  return crypto.createHmac('sha256', JWT_SECRET)
+    .update(`reset:${userId}:${code}`)
+    .digest('hex');
+}
+
+async function deliverResetCode(user, code) {
+  // No provider yet. This function must never log or return the code; the
+  // admin route returns it to the authenticated admin instead. When SMS is
+  // wired, this is the only function that changes.
+  return 'admin';
+}
+
+async function issueResetCode(user) {
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  // One live code per account: older unused codes stop working immediately.
+  await pool.execute(
+    'UPDATE password_resets SET used_at = NOW() WHERE user_id = ? AND used_at IS NULL',
+    [user.id]
+  );
+  await pool.execute(
+    `INSERT INTO password_resets (user_id, code_hash, expires_at)
+     VALUES (?, ?, NOW() + INTERVAL ${RESET_CODE_TTL_SECONDS} SECOND)`,
+    [user.id, hashResetCode(user.id, code)]
+  );
+  return code;
+}
+
+// Same shape as the phone-OTP limiters: an IP bucket plus a per-identifier
+// bucket, so rotating IPs does not buy unlimited guesses for one account.
+const resetIpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => ipKeyGenerator(req),
+  message: { error: 'Too many attempts. Please try again later.' },
+});
+
+const resetIdentifierLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const identifier = String(req.body?.identifier || '').trim().toUpperCase();
+    return identifier ? `pwreset:${identifier}` : ipKeyGenerator(req);
+  },
+  message: { error: 'Too many attempts. Please try again later.' },
+});
+
+// The only shapes this database stores: the 09XXXXXXXXX the app already
+// normalizes to (normalizePhMobile), and the legacy PCST-123456 wallet id.
+// Email is not collected in the schema, so it cannot identify an account.
+function isResetIdentifier(value) {
+  return /^09\d{9}$/.test(value) || /^PCST-\d{6}$/.test(value);
+}
+
+async function findResetUser(identifier) {
+  const [[user]] = await pool.query(
+    `SELECT id, username, phone_number, wallet_id
+       FROM users
+      WHERE (phone_number = ? OR wallet_id = ?) AND status = 'active'
+      LIMIT 1`,
+    [identifier, identifier]
+  );
+  return user || null;
+}
+
+app.post('/api/auth/forgot-password', resetIpLimiter, resetIdentifierLimiter, asyncRoute(async (req, res) => {
+  const identifier = String(req.body?.identifier || '').trim().toUpperCase();
+  // Identical body and status whether the account exists or not.
+  const generic = {
+    ok: true,
+    message: 'If that account exists, a reset code has been created. Contact PayCST support to receive it.',
+  };
+  if (!isResetIdentifier(identifier)) return res.json(generic);
+
+  const user = await findResetUser(identifier);
+  if (user) {
+    const code = await issueResetCode(user);
+    await deliverResetCode(user, code);
+  }
+  res.json(generic);
+}));
+
+app.post('/api/auth/reset-password', resetIpLimiter, resetIdentifierLimiter, asyncRoute(async (req, res) => {
+  const identifier = String(req.body?.identifier || '').trim().toUpperCase();
+  const { code, newPassword } = req.body || {};
+  // One message for "no account", "no live code", "expired", "too many tries"
+  // and "wrong code" so the endpoint cannot be used to probe accounts.
+  const invalidCode = { error: 'That code is invalid or has expired. Please request a new one.' };
+
+  if (!isResetIdentifier(identifier) || typeof code !== 'string' || !/^\d{6}$/.test(code)) {
+    return res.status(400).json(invalidCode);
+  }
+  // Same rule as /api/register.
+  if (typeof newPassword !== 'string' || newPassword.length > 72) {
+    return res.status(400).json({ error: 'Password must be 72 characters or fewer' });
+  }
+  if (newPassword.length < 8 || !/[A-Za-z]/.test(newPassword) || !/\d/.test(newPassword) || !/[@*_-]/.test(newPassword)) {
+    return res.status(400).json({
+      error: 'Password must be at least 8 characters and include a letter, a number, and one of @ * _ -',
+    });
+  }
+
+  const user = await findResetUser(identifier);
+  if (!user) return res.status(400).json(invalidCode);
+
+  const [[row]] = await pool.execute(
+    `SELECT id, code_hash, attempts, (expires_at < NOW()) AS expired
+       FROM password_resets
+      WHERE user_id = ? AND used_at IS NULL
+      ORDER BY id DESC
+      LIMIT 1`,
+    [user.id]
+  );
+  if (!row) return res.status(400).json(invalidCode);
+  if (row.expired || row.attempts >= RESET_MAX_ATTEMPTS) {
+    // Expired or already burned: make sure it can never be used later.
+    await pool.execute(
+      'UPDATE password_resets SET used_at = NOW() WHERE id = ? AND used_at IS NULL',
+      [row.id]
+    );
+    return res.status(400).json(invalidCode);
+  }
+
+  const given = Buffer.from(hashResetCode(user.id, code), 'hex');
+  const real = Buffer.from(row.code_hash, 'hex');
+  if (given.length !== real.length || !crypto.timingSafeEqual(given, real)) {
+    // Atomic increment: the 5th wrong try kills the code in the same statement.
+    await pool.execute(
+      `UPDATE password_resets
+          SET attempts = attempts + 1,
+              used_at = IF(attempts + 1 >= ${RESET_MAX_ATTEMPTS}, NOW(), used_at)
+        WHERE id = ? AND used_at IS NULL`,
+      [row.id]
+    );
+    return res.status(400).json(invalidCode);
+  }
+
+  const passwordHash = await bcrypt.hash(newPassword, 10);
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    // Claim the code first: two requests racing on the same code cannot both win.
+    const [claimed] = await conn.execute(
+      'UPDATE password_resets SET used_at = NOW() WHERE id = ? AND used_at IS NULL',
+      [row.id]
+    );
+    if (claimed.affectedRows !== 1) {
+      await conn.rollback();
+      return res.status(400).json(invalidCode);
+    }
+    await conn.execute(
+      'UPDATE users SET password_hash = ?, session_version = session_version + 1 WHERE id = ?',
+      [passwordHash, user.id]
+    );
+    // Same session invalidation as /api/auth/revoke-all: live tokens carry the
+    // old `sv`, and enrolled fingerprint devices are dropped.
+    await conn.execute('DELETE FROM device_tokens WHERE user_id = ?', [user.id]);
+    // Any other unused code for this account is dead too.
+    await conn.execute(
+      'UPDATE password_resets SET used_at = NOW() WHERE user_id = ? AND used_at IS NULL',
+      [user.id]
+    );
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+
+  await refreshUserInIndex(user.id);
+  res.json({ ok: true, message: 'Password updated. Log in with your new password.' });
+}));
+
 // The fingerprint phones enrolled on this account. Only metadata leaves the
 // server: token_hash is the credential these rows exist to protect, so it is
 // never selected and never returned. expires_at is included so the client can
@@ -4146,6 +4338,26 @@ app.post('/api/admin/users/:id/status', requireAdmin, asyncRoute(async (req, res
   await refreshUserInIndex(userId);
   await logAdmin(req, suspend ? 'suspend_user' : 'unsuspend_user', 'user', userId);
   res.json({ ok: true, status: suspend ? 'suspended' : 'active' });
+}));
+
+// Admin-assisted password recovery. The code is returned ONLY in this
+// authenticated-admin response; it is never logged or written to the audit
+// trail (the task forbids logging ids, and the code is a credential).
+app.post('/api/admin/users/:id/password-reset', requireAdmin, asyncRoute(async (req, res) => {
+  const userId = Number(req.params.id);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ error: 'Invalid user ID' });
+  }
+
+  const [[user]] = await pool.query(
+    'SELECT id, username, phone_number, wallet_id FROM users WHERE id = ?',
+    [userId]
+  );
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  const code = await issueResetCode(user);
+  await deliverResetCode(user, code);
+  res.json({ ok: true, code, expiresInSeconds: RESET_CODE_TTL_SECONDS });
 }));
 
 
