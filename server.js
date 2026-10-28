@@ -4382,8 +4382,8 @@ app.post('/api/admin/users/:id/status', requireAdmin, asyncRoute(async (req, res
 }));
 
 // Admin-assisted password recovery. The code is returned ONLY in this
-// authenticated-admin response; it is never logged or written to the audit
-// trail (the task forbids logging ids, and the code is a credential).
+// authenticated-admin response. The audit row records who issued it and for
+// which user, never the code, its hash, or a password.
 app.post('/api/admin/users/:id/password-reset', requireAdmin, asyncRoute(async (req, res) => {
   const userId = Number(req.params.id);
   if (!Number.isInteger(userId) || userId <= 0) {
@@ -4398,6 +4398,7 @@ app.post('/api/admin/users/:id/password-reset', requireAdmin, asyncRoute(async (
 
   const code = await issueResetCode(user);
   await deliverResetCode(user, code);
+  await logAdmin(req, 'issue_password_reset', 'user', userId);
   res.json({ ok: true, code, expiresInSeconds: RESET_CODE_TTL_SECONDS });
 }));
 
