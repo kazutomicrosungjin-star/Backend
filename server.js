@@ -983,9 +983,9 @@ const availabilityLimiter = rateLimit({
 // Sign-up flow: the app asks for a code (send-otp), the person types the 6 digits
 // they received (verify-otp), and the server hands back a short-lived signed token
 // that /api/register requires. Codes are stored hashed, expire after 5 minutes,
-// allow 5 wrong guesses, and can only be re-sent once a minute.
+// allow 5 wrong guesses, and can only be re-sent every 15 seconds.
 const OTP_TTL_SECONDS = 5 * 60;
-const OTP_RESEND_SECONDS = 60;
+const OTP_RESEND_SECONDS = 15;
 const OTP_MAX_ATTEMPTS = 5;
 const OTP_MAX_SENDS_PER_HOUR = 5;
 // Global cap across all numbers, separate from the per-number limit above.
