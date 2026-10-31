@@ -691,6 +691,17 @@ const moneyLimiter = rateLimit({
   message: { error: 'Too many payments in a short time. Please wait a minute and try again.' },
 });
 
+// Profile edits are not money actions, but they still write personal data and
+// deserve the same per-user throttle rather than an unauthenticated IP bucket.
+const profileLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => (req.userId ? `u:${req.userId}` : ipKeyGenerator(req)),
+  message: { error: 'Too many profile updates. Please wait a moment and try again.' },
+});
+
 // Records what each admin did. Best effort: a logging problem never blocks the action.
 async function logAdmin(req, action, targetType, targetId, details) {
   try {
@@ -754,6 +765,97 @@ function cleanText(value, max) {
     .replace(/[\u0000-\u001f\u007f<>]/g, '')
     .trim()
     .slice(0, max);
+}
+
+// Profile fields are personal data. They are returned only to the account
+// owner (or an admin reviewing an upgrade) and are never logged.
+function profileFields(row) {
+  return {
+    fullName: row.full_name || null,
+    birthdate: row.birthdate || null,
+    nationality: row.nationality || null,
+    address: row.address || null,
+    email: row.email || null,
+  };
+}
+
+function parseBirthdate(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return null;
+  }
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return date;
+}
+
+// Whole years on today's date. A birthday later this year has not happened
+// yet; on the birthday itself the age has increased. A 29 February birthday
+// therefore turns 18 on 1 March in a non-leap year.
+function ageInYears(birthdate, today) {
+  let age = today.getUTCFullYear() - birthdate.getUTCFullYear();
+  const monthDifference = today.getUTCMonth() - birthdate.getUTCMonth();
+  if (
+    monthDifference < 0 ||
+    (monthDifference === 0 && today.getUTCDate() < birthdate.getUTCDate())
+  ) {
+    age -= 1;
+  }
+  return age;
+}
+
+function birthdateError(value) {
+  const date = parseBirthdate(value);
+  if (!date) return 'Enter a valid birthday (YYYY-MM-DD)';
+  const now = new Date();
+  const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  if (date > today) return 'Birthday cannot be in the future';
+  const age = ageInYears(date, today);
+  if (age < 18) return 'You must be at least 18 years old to register';
+  if (age > 120) return 'Enter a valid birthday';
+  return null;
+}
+
+function fullNameError(value) {
+  const name = cleanText(value, 100);
+  if (name.length < 2) return 'Full name must be at least 2 characters';
+  if (!/\p{L}/u.test(name) || !/^[\p{L} .,'-]+$/u.test(name)) {
+    return "Full name can only use letters, spaces, and . , ' -";
+  }
+  return null;
+}
+
+function nationalityError(value) {
+  const nationality = cleanText(value, 50);
+  if (nationality.length < 2) return 'Nationality must be at least 2 characters';
+  if (!/^[\p{L} ]+$/u.test(nationality)) {
+    return 'Nationality can only use letters and spaces';
+  }
+  return null;
+}
+
+function addressError(value) {
+  if (cleanText(value, 255).length < 5) {
+    return 'Address must be at least 5 characters';
+  }
+  return null;
+}
+
+function emailValue(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return { value: null };
+  if (raw.length > 254) return { error: 'Email must be 254 characters or fewer' };
+  const email = cleanText(raw, 254).toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return { error: 'Enter a valid email address' };
+  }
+  return { value: email };
 }
 
 // Money actions (send, QR pay, load, bill pay) need the PIN again, so a stolen
@@ -1214,12 +1316,29 @@ const KEEP_ID_PHOTOS = process.env.KEEP_ID_PHOTOS === 'true';
 // photos or selfie are collected here; those are submitted later through
 // POST /api/verification/upgrade to unlock the higher limits.
 app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req, res) => {
-  const { username, password, pin, phoneNumber, termsAccepted, phoneVerificationToken } = req.body || {};
+  const {
+    username,
+    password,
+    pin,
+    phoneNumber,
+    fullName,
+    birthdate,
+    nationality,
+    address,
+    termsAccepted,
+    phoneVerificationToken,
+  } = req.body || {};
 
-  if (!username || !password || !pin || !phoneNumber) {
-    return res.status(400).json({ error: 'username, password, pin, and phoneNumber are required' });
+  if (!username || !password || !pin || !phoneNumber || !fullName || !birthdate || !nationality || !address) {
+    return res.status(400).json({
+      error: 'username, password, pin, phoneNumber, fullName, birthdate, nationality, and address are required',
+    });
   }
-  if ([username, password, pin, phoneNumber].some((v) => typeof v !== 'string')) {
+  if (
+    [username, password, pin, phoneNumber, fullName, birthdate, nationality, address].some(
+      (v) => typeof v !== 'string'
+    )
+  ) {
     return res.status(400).json({ error: 'Invalid request' });
   }
   if (!/^[A-Za-z0-9_. -]{3,30}$/.test(username.trim())) {
@@ -1235,6 +1354,14 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
   if (!/^09\d{9}$/.test(phoneNumber)) {
     return res.status(400).json({ error: 'Phone number must be 11 digits starting with 09 (e.g. 09171234567)' });
   }
+  const fullNameProblem = fullNameError(fullName);
+  if (fullNameProblem) return res.status(400).json({ error: fullNameProblem });
+  const birthdateProblem = birthdateError(birthdate);
+  if (birthdateProblem) return res.status(400).json({ error: birthdateProblem });
+  const nationalityProblem = nationalityError(nationality);
+  if (nationalityProblem) return res.status(400).json({ error: nationalityProblem });
+  const addressProblem = addressError(address);
+  if (addressProblem) return res.status(400).json({ error: addressProblem });
   if (!termsAccepted) {
     return res.status(400).json({ error: 'You must accept the Terms and Conditions to register' });
   }
@@ -1267,10 +1394,22 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
       [result] = await conn.execute(
         `INSERT INTO users
            (username, password_hash, pin_hash, wallet_id, balance, phone_number,
+            full_name, birthdate, nationality, address,
             government_id_number, government_id_photo, government_id_photo_back, selfie_photo,
             terms_accepted_at, verification_status, verification_level, liveness_status)
-         VALUES (?, ?, ?, ?, ?, ?, NULL, '', '', '', NOW(), 'approved', 'basic', 'skipped')`,
-        [username, passwordHash, pinHash, walletId, 0, phoneNumber]
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', '', '', NOW(), 'approved', 'basic', 'skipped')`,
+        [
+          username,
+          passwordHash,
+          pinHash,
+          walletId,
+          0,
+          phoneNumber,
+          cleanText(fullName, 100),
+          birthdate,
+          cleanText(nationality, 50),
+          cleanText(address, 255),
+        ]
       );
     } catch (err) {
       if (err.code === 'ER_DUP_ENTRY') {
@@ -1357,9 +1496,12 @@ app.post('/api/login/verify-pin', pinLimiter, asyncRoute(async (req, res) => {
     return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedForSeconds} second(s).` });
   }
 
-  const [rows] = await pool.execute('SELECT id, username, wallet_id, pin_hash, balance, session_version FROM users WHERE id = ?', [
-    payload.uid,
-  ]);
+  const [rows] = await pool.execute(
+    `SELECT id, username, wallet_id, pin_hash, balance, session_version,
+            full_name, DATE_FORMAT(birthdate, '%Y-%m-%d') AS birthdate, nationality, address, email
+       FROM users WHERE id = ?`,
+    [payload.uid]
+  );
   const user = rows[0];
   const ok = await bcrypt.compare(pin, user ? user.pin_hash : DUMMY_BCRYPT_HASH);
   if (!user || !ok) {
@@ -1373,7 +1515,13 @@ app.post('/api/login/verify-pin', pinLimiter, asyncRoute(async (req, res) => {
     token,
     // balance is returned as an integer count of centavos — the client
     // divides by 100 only when displaying it.
-    user: { id: user.id, username: user.username, walletId: user.wallet_id, balance: toCentavos(user.balance) },
+    user: {
+      id: user.id,
+      username: user.username,
+      walletId: user.wallet_id,
+      balance: toCentavos(user.balance),
+      ...profileFields(user),
+    },
   });
 }));
 
@@ -1424,7 +1572,8 @@ app.post('/api/login/device', deviceLoginLimiter, asyncRoute(async (req, res) =>
   }
   const oldHash = sha256(deviceToken);
   const [[row]] = await pool.query(
-    `SELECT d.id AS device_id, u.id, u.username, u.wallet_id, u.balance, u.status, u.verification_status, u.session_version
+    `SELECT d.id AS device_id, u.id, u.username, u.wallet_id, u.balance, u.status, u.verification_status, u.session_version,
+            u.full_name, DATE_FORMAT(u.birthdate, '%Y-%m-%d') AS birthdate, u.nationality, u.address, u.email
        FROM device_tokens d JOIN users u ON u.id = d.user_id
       WHERE d.token_hash = ? AND d.expires_at > NOW()`,
     [oldHash]
@@ -1449,7 +1598,13 @@ app.post('/api/login/device', deviceLoginLimiter, asyncRoute(async (req, res) =>
   res.json({
     token: sign({ uid: row.id, stage: 'full', role: 'user', sv: row.session_version }, '2h'),
     deviceToken: newToken,
-    user: { id: row.id, username: row.username, walletId: row.wallet_id, balance: toCentavos(row.balance) },
+    user: {
+      id: row.id,
+      username: row.username,
+      walletId: row.wallet_id,
+      balance: toCentavos(row.balance),
+      ...profileFields(row),
+    },
   });
 }));
 
@@ -1478,7 +1633,9 @@ app.post('/api/auth/revoke-all', requireAuth, requirePin, asyncRoute(async (req,
     // Read the new version on the same connection and inside the transaction,
     // so the token below is signed with exactly the value that was committed.
     const [[row]] = await conn.query(
-      'SELECT id, username, wallet_id, balance, session_version FROM users WHERE id = ?',
+      `SELECT id, username, wallet_id, balance, session_version,
+              full_name, DATE_FORMAT(birthdate, '%Y-%m-%d') AS birthdate, nationality, address, email
+         FROM users WHERE id = ?`,
       [req.userId]
     );
     if (!row) {
@@ -1488,7 +1645,13 @@ app.post('/api/auth/revoke-all', requireAuth, requirePin, asyncRoute(async (req,
     await conn.commit();
     res.json({
       token: sign({ uid: row.id, stage: 'full', role: 'user', sv: row.session_version }, '2h'),
-      user: { id: row.id, username: row.username, walletId: row.wallet_id, balance: toCentavos(row.balance) },
+      user: {
+        id: row.id,
+        username: row.username,
+        walletId: row.wallet_id,
+        balance: toCentavos(row.balance),
+        ...profileFields(row),
+      },
     });
   } catch (err) {
     await conn.rollback();
@@ -1538,7 +1701,9 @@ app.post('/api/auth/change-pin', requireAuth, pinLimiter, asyncRoute(async (req,
     // Same connection and transaction as the writes above, so the token is
     // signed with the version that is actually committed.
     const [[row]] = await conn.query(
-      'SELECT id, username, wallet_id, balance, session_version FROM users WHERE id = ?',
+      `SELECT id, username, wallet_id, balance, session_version,
+              full_name, DATE_FORMAT(birthdate, '%Y-%m-%d') AS birthdate, nationality, address, email
+         FROM users WHERE id = ?`,
       [req.userId]
     );
     if (!row) {
@@ -1548,7 +1713,13 @@ app.post('/api/auth/change-pin', requireAuth, pinLimiter, asyncRoute(async (req,
     await conn.commit();
     res.json({
       token: sign({ uid: row.id, stage: 'full', role: 'user', sv: row.session_version }, '2h'),
-      user: { id: row.id, username: row.username, walletId: row.wallet_id, balance: toCentavos(row.balance) },
+      user: {
+        id: row.id,
+        username: row.username,
+        walletId: row.wallet_id,
+        balance: toCentavos(row.balance),
+        ...profileFields(row),
+      },
     });
   } catch (err) {
     await conn.rollback();
@@ -1902,7 +2073,9 @@ app.get('/api/auth/devices', requireAuth, asyncRoute(async (req, res) => {
 
 app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute(
-    'SELECT id, username, wallet_id, balance, verification_level, liveness_status FROM users WHERE id = ?',
+    `SELECT id, username, wallet_id, balance, verification_level, liveness_status,
+            full_name, DATE_FORMAT(birthdate, '%Y-%m-%d') AS birthdate, nationality, address, email
+       FROM users WHERE id = ?`,
     [req.userId]
   );
   if (!rows[0]) return res.status(404).json({ error: 'User not found' });
@@ -1938,6 +2111,7 @@ app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
     wallet_id: u.wallet_id,
     walletId: u.wallet_id,
     balance: toCentavos(u.balance),
+    ...profileFields(u),
     verification: {
       level: u.verification_level,
       livenessStatus: u.liveness_status,
@@ -1945,6 +2119,91 @@ app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
       rejectionReason: upgradeRejectionReason,
     },
   });
+}));
+
+// Editable profile details. Full name and birthday are write-once: they can be
+// filled in when the column is still NULL, then never changed. Address,
+// nationality and email stay editable; address and nationality may not be
+// blanked once they have a value. This is not a money route, so no PIN or
+// idempotency key is required.
+app.patch('/api/me/profile', requireAuth, profileLimiter, asyncRoute(async (req, res) => {
+  const body = req.body || {};
+  const has = (key) => Object.prototype.hasOwnProperty.call(body, key);
+
+  const [rows] = await pool.execute(
+    `SELECT full_name, DATE_FORMAT(birthdate, '%Y-%m-%d') AS birthdate, nationality, address, email
+       FROM users WHERE id = ?`,
+    [req.userId]
+  );
+  const current = rows[0];
+  if (!current) return res.status(404).json({ error: 'User not found' });
+
+  const updates = {};
+
+  if (has('fullName')) {
+    if (current.full_name) {
+      return res.status(400).json({ error: 'Full name cannot be changed once it is set' });
+    }
+    const problem = fullNameError(body.fullName);
+    if (problem) return res.status(400).json({ error: problem });
+    updates.full_name = cleanText(body.fullName, 100);
+  }
+
+  if (has('birthdate')) {
+    if (current.birthdate) {
+      return res.status(400).json({ error: 'Birthday cannot be changed once it is set' });
+    }
+    const problem = birthdateError(body.birthdate);
+    if (problem) return res.status(400).json({ error: problem });
+    updates.birthdate = body.birthdate;
+  }
+
+  if (has('nationality')) {
+    const nationality = cleanText(body.nationality, 50);
+    if (!nationality) {
+      if (current.nationality) {
+        return res.status(400).json({ error: 'Nationality cannot be empty once it is set' });
+      }
+    } else {
+      const problem = nationalityError(body.nationality);
+      if (problem) return res.status(400).json({ error: problem });
+      updates.nationality = nationality;
+    }
+  }
+
+  if (has('address')) {
+    const address = cleanText(body.address, 255);
+    if (!address) {
+      if (current.address) {
+        return res.status(400).json({ error: 'Address cannot be empty once it is set' });
+      }
+    } else {
+      const problem = addressError(body.address);
+      if (problem) return res.status(400).json({ error: problem });
+      updates.address = address;
+    }
+  }
+
+  if (has('email')) {
+    const email = emailValue(body.email);
+    if (email.error) return res.status(400).json({ error: email.error });
+    updates.email = email.value;
+  }
+
+  const fields = Object.keys(updates);
+  if (fields.length > 0) {
+    await pool.execute(
+      `UPDATE users SET ${fields.map((field) => `${field} = ?`).join(', ')} WHERE id = ?`,
+      [...fields.map((field) => updates[field]), req.userId]
+    );
+  }
+
+  const [freshRows] = await pool.execute(
+    `SELECT full_name, DATE_FORMAT(birthdate, '%Y-%m-%d') AS birthdate, nationality, address, email
+       FROM users WHERE id = ?`,
+    [req.userId]
+  );
+  res.json({ ok: true, ...profileFields(freshRows[0]) });
 }));
 
 // Post-login upgrade from 'basic' (or 'verified') to 'fully_verified'. This is
@@ -5276,6 +5535,7 @@ app.post('/api/admin/verifications/:id/respond', requireAdmin, asyncRoute(async 
 app.get('/api/admin/verification-upgrades/pending', requireAdmin, asyncRoute(async (req, res) => {
   const [rows] = await pool.query(
     `SELECT v.id, v.user_id AS userId, u.username, u.wallet_id AS walletId,
+            u.full_name AS fullName, DATE_FORMAT(u.birthdate, '%Y-%m-%d') AS birthdate,
             v.upgrade_method AS upgradeMethod,
             v.government_id_number AS governmentIdNumber,
             v.liveness_status AS livenessStatus,
