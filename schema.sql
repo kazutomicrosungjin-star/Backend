@@ -36,6 +36,11 @@ CREATE TABLE IF NOT EXISTS users (
   -- target, not a cap the server enforces.
   monthly_budget_centavos BIGINT NULL,
   phone_number VARCHAR(20) NULL,
+  full_name VARCHAR(100) NULL,
+  birthdate DATE NULL,
+  nationality VARCHAR(50) NULL,
+  address VARCHAR(255) NULL,
+  email VARCHAR(254) NULL,
   government_id_number VARCHAR(64) NULL,
   government_id_photo LONGTEXT NULL,
   government_id_photo_back LONGTEXT NULL,
