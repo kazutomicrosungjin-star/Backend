@@ -2969,6 +2969,8 @@ app.post('/api/requests/split', requireAuth, moneyLimiter, idempotent, asyncRout
 app.get('/api/limits', requireAuth, asyncRoute(async (req, res) => {
   const level = ['basic', 'fully_verified'].includes(req.verificationLevel) ? req.verificationLevel : 'verified';
   const limits = limitsForUser(level);
+  const basic = limitsForUser('basic');
+  const fullyVerified = limitsForUser('fully_verified');
   const used = await spentInLast24h(pool, req.userId);
   res.json({
     perTransactionCentavos: limits.perTransactionCentavos,
@@ -2977,6 +2979,21 @@ app.get('/api/limits', requireAuth, asyncRoute(async (req, res) => {
     usedCentavos: used,
     remainingCentavos: Math.max(0, limits.dailyCentavos - used),
     level,
+    // Both level tables are public account rules, not someone else's data, so
+    // the app can show what a Basic or Fully Verified account gets even when
+    // the signed-in account is on the legacy 'verified' level.
+    levels: {
+      basic: {
+        perTransactionCentavos: basic.perTransactionCentavos,
+        dailyCentavos: basic.dailyCentavos,
+        maxBalanceCentavos: basic.maxBalanceCentavos,
+      },
+      fullyVerified: {
+        perTransactionCentavos: fullyVerified.perTransactionCentavos,
+        dailyCentavos: fullyVerified.dailyCentavos,
+        maxBalanceCentavos: fullyVerified.maxBalanceCentavos,
+      },
+    },
   });
 }));
 
