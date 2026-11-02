@@ -15,8 +15,9 @@
 // so ask if you'd like them added too.
 //
 // SIGN-UP / VERIFICATION MODEL (GCash-style):
-//   - Sign-up only needs username, password, PIN, phone number (SMS code)
-//     and the terms. No ID number, ID photos or selfie are collected.
+//   - Sign-up needs full name, password, PIN, phone number (SMS code) and the
+//     terms. The server generates the internal username. No ID number, ID
+//     photos or selfie are collected.
 //   - New accounts start at verification_level 'basic' (limited access).
 //   - To unlock higher limits, the user submits their ID number, ID photos
 //     and a selfie through POST /api/verification/upgrade. An admin reviews
@@ -158,20 +159,24 @@ app.use(express.json({ limit: '100kb' }));
 // present a different X-Forwarded-For chain length per request, which
 // makes req.ip unreliable even with `trust proxy` set — the same client
 // can appear to come from a different "IP" on consecutive requests,
-// silently defeating IP-based limiting. Username is a fixed, real value
-// tied to the account under attack, so it can't be dodged by an attacker
+// silently defeating IP-based limiting. The login identifier is a fixed, real
+// value tied to the account under attack, so it can't be dodged by an attacker
 // rotating source IPs — if anything this is the stronger defense for
-// credential-stuffing specifically. Falls back to req.ip only when no
-// username is present in the body (shouldn't normally happen on these
-// routes, but keeps behavior sane rather than throwing).
+// credential-stuffing specifically. Phone formats are canonicalized so
+// +63..., 63..., and 09... share one bucket. Falls back to req.ip when no
+// identifier is present.
 function authKeyGenerator(req) {
-  const username = req.body?.username?.toString().trim().toLowerCase();
-  return username || ipKeyGenerator(req);
+  const raw = req.body?.username?.toString().trim();
+  const phone = normalizePhone(raw);
+  if (phone) return `phone:${phone}`;
+  if (raw) return raw.toLowerCase();
+  const registrationPhone = normalizePhone(req.body?.phoneNumber);
+  return registrationPhone ? `phone:${registrationPhone}` : ipKeyGenerator(req);
 }
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10, // 10 attempts per username per window
+  max: 10, // 10 attempts per identifier/phone per window
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: authKeyGenerator,
@@ -1129,6 +1134,34 @@ function normalizePhone(value) {
   return /^09\d{9}$/.test(digits) ? digits : null;
 }
 
+// Sign-up no longer asks for a username, but users.username is NOT NULL and
+// UNIQUE. Build a readable handle from the full name and add a short random
+// suffix so two people with the same name can both register. The suffix is
+// checked against the DB and the in-memory username index before use.
+function usernameBaseFromFullName(value) {
+  const base = String(value ?? '')
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '.')
+    .replace(/^[._-]+|[._-]+$/g, '')
+    .slice(0, 23)
+    .replace(/[._-]+$/g, '');
+  return base || 'user';
+}
+
+async function generateUniqueUsername(conn, fullName) {
+  const base = usernameBaseFromFullName(fullName);
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const suffix = crypto.randomBytes(3).toString('hex');
+    const candidate = `${base}-${suffix}`;
+    if (usersByUsername.has(candidate)) continue;
+    const [rows] = await conn.execute('SELECT id FROM users WHERE username = ? LIMIT 1', [candidate]);
+    if (rows.length === 0) return candidate;
+  }
+  throw new Error('Could not generate a unique username');
+}
+
 // These routes read the phone before their own validation, so normalize at the
 // route edge. Exact paths only: PCST-123456 returns null from normalizePhone()
 // and is left exactly as it was.
@@ -1286,8 +1319,8 @@ app.get('/api/register/check', availabilityLimiter, asyncRoute(async (req, res) 
   res.json({ usernameTaken, phoneTaken });
 }));
 
-// Per-IP cap on sign-ups, on top of the per-username limit (which an attacker
-// could dodge by changing the username every time).
+// Per-IP cap on sign-ups, on top of the per-phone/identifier limit (which an
+// attacker could dodge by changing the phone every time).
 const registerIpLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 10,
@@ -1316,8 +1349,8 @@ const KEEP_ID_PHOTOS = process.env.KEEP_ID_PHOTOS === 'true';
 // photos or selfie are collected here; those are submitted later through
 // POST /api/verification/upgrade to unlock the higher limits.
 app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req, res) => {
+  let { username } = req.body || {};
   const {
-    username,
     password,
     pin,
     phoneNumber,
@@ -1329,19 +1362,21 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
     phoneVerificationToken,
   } = req.body || {};
 
-  if (!username || !password || !pin || !phoneNumber || !fullName || !birthdate || !nationality || !address) {
+  if (!password || !pin || !phoneNumber || !fullName || !birthdate || !nationality || !address) {
     return res.status(400).json({
-      error: 'username, password, pin, phoneNumber, fullName, birthdate, nationality, and address are required',
+      error: 'password, pin, phoneNumber, fullName, birthdate, nationality, and address are required',
     });
   }
   if (
-    [username, password, pin, phoneNumber, fullName, birthdate, nationality, address].some(
+    [password, pin, phoneNumber, fullName, birthdate, nationality, address].some(
       (v) => typeof v !== 'string'
-    )
+    ) ||
+    (username != null && typeof username !== 'string')
   ) {
     return res.status(400).json({ error: 'Invalid request' });
   }
-  if (!/^[A-Za-z0-9_. -]{3,30}$/.test(username.trim())) {
+  if (typeof username === 'string') username = username.trim();
+  if (username && !/^[A-Za-z0-9_. -]{3,30}$/.test(username)) {
     return res.status(400).json({ error: 'Username must be 3-30 characters: letters, numbers, spaces, . _ -' });
   }
   if (password.length > 72) return res.status(400).json({ error: 'Password must be 72 characters or fewer' });
@@ -1374,11 +1409,14 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
 
   const conn = await pool.getConnection();
   try {
-    if (usersByUsername.has(username)) {
-      return res.status(409).json({ error: 'That username is already taken' });
+    const usernameProvided = Boolean(username);
+    if (usernameProvided) {
+      if (usersByUsername.has(username)) {
+        return res.status(409).json({ error: 'That username is already taken' });
+      }
+      const [existingUsername] = await conn.execute('SELECT id FROM users WHERE username = ?', [username]);
+      if (existingUsername.length > 0) return res.status(409).json({ error: 'That username is already taken' });
     }
-    const [existingUsername] = await conn.execute('SELECT id FROM users WHERE username = ?', [username]);
-    if (existingUsername.length > 0) return res.status(409).json({ error: 'That username is already taken' });
 
     const [existingPhone] = await conn.execute('SELECT id FROM users WHERE phone_number = ?', [phoneNumber]);
     if (existingPhone.length > 0) {
@@ -1390,36 +1428,40 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
     const walletId = phoneNumber;
 
     let result;
-    try {
-      [result] = await conn.execute(
-        `INSERT INTO users
-           (username, password_hash, pin_hash, wallet_id, balance, phone_number,
-            full_name, birthdate, nationality, address,
-            government_id_number, government_id_photo, government_id_photo_back, selfie_photo,
-            terms_accepted_at, verification_status, verification_level, liveness_status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', '', '', NOW(), 'approved', 'basic', 'skipped')`,
-        [
-          username,
-          passwordHash,
-          pinHash,
-          walletId,
-          0,
-          phoneNumber,
-          cleanText(fullName, 100),
-          birthdate,
-          cleanText(nationality, 50),
-          cleanText(address, 255),
-        ]
-      );
-    } catch (err) {
-      if (err.code === 'ER_DUP_ENTRY') {
+    for (let attempt = 0; ; attempt += 1) {
+      if (!usernameProvided) username = await generateUniqueUsername(conn, fullName);
+      try {
+        [result] = await conn.execute(
+          `INSERT INTO users
+             (username, password_hash, pin_hash, wallet_id, balance, phone_number,
+              full_name, birthdate, nationality, address,
+              government_id_number, government_id_photo, government_id_photo_back, selfie_photo,
+              terms_accepted_at, verification_status, verification_level, liveness_status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', '', '', NOW(), 'approved', 'basic', 'skipped')`,
+          [
+            username,
+            passwordHash,
+            pinHash,
+            walletId,
+            0,
+            phoneNumber,
+            cleanText(fullName, 100),
+            birthdate,
+            cleanText(nationality, 50),
+            cleanText(address, 255),
+          ]
+        );
+        break;
+      } catch (err) {
+        if (err.code !== 'ER_DUP_ENTRY') throw err;
         const m = err.sqlMessage || '';
-        const msg = /phone|wallet/i.test(m)
-          ? 'That phone number is already registered to an account'
-          : 'That username is already taken';
-        return res.status(409).json({ error: msg });
+        if (/phone|wallet/i.test(m)) {
+          return res.status(409).json({ error: 'That phone number is already registered to an account' });
+        }
+        // A generated handle lost a race with another sign-up: make a new one.
+        if (!usernameProvided && attempt < 2) continue;
+        return res.status(409).json({ error: 'That username is already taken' });
       }
-      throw err;
     }
 
     await refreshUserInIndex(result.insertId);
@@ -1441,31 +1483,47 @@ app.post('/api/register', registerIpLimiter, authLimiter, asyncRoute(async (req,
 // pin-verify step below.
 app.post('/api/login', authLimiter, asyncRoute(async (req, res) => {
   const { username, password } = req.body || {};
-  if (!username || !password) return res.status(400).json({ error: 'username and password are required' });
+  const identifierInput = typeof username === 'string' ? username.trim() : '';
+  if (!identifierInput || !password) {
+    return res.status(400).json({ error: 'Mobile number/username and password are required' });
+  }
 
-  const identifier = `login:${username.toString().trim().toLowerCase()}`;
-  const lockedForSeconds = await checkLockout(identifier);
+  // Phone first, then the legacy username/email lookup. A valid phone that
+  // matches no account still falls through to the old identifiers.
+  const phone = normalizePhone(identifierInput);
+  const lockIdentifier = `login:${(phone || identifierInput).toLowerCase()}`;
+  const lockedForSeconds = await checkLockout(lockIdentifier);
   if (lockedForSeconds !== null) {
     return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedForSeconds} second(s).` });
   }
 
-  const [rows] = await pool.execute(
-    'SELECT id, password_hash, status, verification_status FROM users WHERE username = ?',
-    [username]
-  );
-  const user = rows[0];
-  // Always run bcrypt, even when the username doesn't exist, so a lookup
+  let user;
+  if (phone) {
+    const [phoneRows] = await pool.execute(
+      'SELECT id, password_hash, status, verification_status FROM users WHERE phone_number = ? OR wallet_id = ? LIMIT 1',
+      [phone, phone]
+    );
+    user = phoneRows[0];
+  }
+  if (!user) {
+    const [rows] = await pool.execute(
+      'SELECT id, password_hash, status, verification_status FROM users WHERE username = ? OR email = ? LIMIT 1',
+      [identifierInput, identifierInput]
+    );
+    user = rows[0];
+  }
+  // Always run bcrypt, even when the identifier doesn't exist, so a lookup
   // miss takes the same time as a real-but-wrong-password attempt —
-  // otherwise the instant-return-on-miss path leaks which usernames are
+  // otherwise the instant-return-on-miss path leaks which accounts are
   // registered via response timing.
   const ok = await bcrypt.compare(password, user ? user.password_hash : DUMMY_BCRYPT_HASH);
   if (!user || !ok) {
-    await recordFailedAttempt(identifier);
-    return res.status(401).json({ error: 'Incorrect username or password' });
+    await recordFailedAttempt(lockIdentifier);
+    return res.status(401).json({ error: 'Incorrect mobile number, username, or password' });
   }
   // Checked AFTER password verification (not before) so a wrong-password
-  // attempt against a suspended account still just says "incorrect
-  // username or password" — it doesn't leak account status to a guesser.
+  // attempt against a suspended account still just says "incorrect login
+  // details" — it doesn't leak account status to a guesser.
   if (user.status === 'suspended') {
     return res.status(403).json({ error: 'This account has been suspended. Contact support for assistance.' });
   }
@@ -1475,7 +1533,7 @@ app.post('/api/login', authLimiter, asyncRoute(async (req, res) => {
   if (user.verification_status === 'rejected') {
     return res.status(403).json({ error: 'Your ID verification was not approved. Contact support for assistance.' });
   }
-  await clearAttempts(identifier);
+  await clearAttempts(lockIdentifier);
 
   const pendingToken = sign({ uid: user.id, stage: 'pending', role: 'user' }, '5m');
   res.json({ pendingToken });
