@@ -1,5 +1,6 @@
 require('dotenv').config();
 const mysql = require('mysql2/promise');
+const { dbSslOptions } = require('./db-ssl');
 
 // A pool, not a single connection — reused across requests, handles
 // reconnects, and every query below goes through parameterized `?`
@@ -17,7 +18,7 @@ const pool = mysql.createPool({
   database: process.env.DB_NAME,
   waitForConnections: true,
   connectionLimit: 10,
-  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: true } : undefined,
+  ssl: dbSslOptions(),
 });
 
 module.exports = pool;

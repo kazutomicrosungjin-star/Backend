@@ -5,6 +5,7 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const mysql = require('mysql2/promise');
+const { dbSslOptions } = require('./db-ssl');
 
 async function setupDatabase() {
   let sql = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
@@ -20,7 +21,7 @@ async function setupDatabase() {
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
     multipleStatements: true,
-    ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: true } : undefined,
+    ssl: dbSslOptions(),
   });
   try {
     await conn.query(sql);

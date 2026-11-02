@@ -7,6 +7,7 @@
 require('dotenv').config();
 const bcrypt = require('bcrypt');
 const mysql = require('mysql2/promise');
+const { dbSslOptions } = require('./db-ssl');
 
 async function main() {
   const [, , username, password, pin] = process.argv;
@@ -29,6 +30,7 @@ async function main() {
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
+    ssl: dbSslOptions(),
   });
 
   const passwordHash = await bcrypt.hash(password, 10);
