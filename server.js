@@ -87,7 +87,16 @@ const crypto = require('crypto');
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const pool = require('./db');
-const { sendSms, smsIsReal } = require('./sms');
+const semaphoreSms = require('./sms');
+const { sendSms: sendMoceanSms } = require('./sms-mocean');
+const SMS_PROVIDER = process.env.SMS_PROVIDER || 'semaphore';
+if (SMS_PROVIDER !== 'semaphore' && SMS_PROVIDER !== 'mocean') {
+  throw new Error("SMS_PROVIDER must be 'semaphore' or 'mocean'");
+}
+const smsIsReal = SMS_PROVIDER === 'mocean'
+  ? Boolean(process.env.MOCEAN_API_TOKEN)
+  : semaphoreSms.smsIsReal;
+const sendSms = SMS_PROVIDER === 'mocean' ? sendMoceanSms : semaphoreSms.sendSms;
 const { getNowShowing } = require('./movies');
 const { PROVIDERS, findCheapestRoute } = require('./graph');
 process.on('unhandledRejection', (reason) => {
@@ -1246,12 +1255,14 @@ app.post('/api/phone/send-otp', otpSendLimiter, asyncRoute(async (req, res) => {
     [phoneNumber, hashOtp(phoneNumber, code)]
   );
 
-  try {
-    await sendSms(phoneNumber, `Your PayCST verification code is ${code}. It expires in 5 minutes. Do not share it with anyone.`);
-  } catch (err) {
-    console.error('SMS send failed:', err.message);
-    await pool.execute('DELETE FROM phone_otps WHERE id = ?', [result.insertId]);
-    return res.status(502).json({ error: 'We could not send the text message. Please try again in a moment.' });
+  if (smsIsReal) {
+    try {
+      await sendSms(phoneNumber, `Your PayCST verification code is ${code}. It expires in 5 minutes. Do not share it with anyone.`);
+    } catch (err) {
+      console.error('SMS send failed:', err.message);
+      await pool.execute('DELETE FROM phone_otps WHERE id = ?', [result.insertId]);
+      return res.status(502).json({ error: 'We could not send the text message. Please try again in a moment.' });
+    }
   }
 
   const body = { ok: true, expiresInSeconds: OTP_TTL_SECONDS, resendAfterSeconds: OTP_RESEND_SECONDS };
