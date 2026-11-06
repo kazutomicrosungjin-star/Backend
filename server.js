@@ -1144,26 +1144,24 @@ function normalizePhone(value) {
 }
 
 // Sign-up no longer asks for a username, but users.username is NOT NULL and
-// UNIQUE. Build a readable handle from the full name and add a short random
-// suffix so two people with the same name can both register. The suffix is
-// checked against the DB and the in-memory username index before use.
+// UNIQUE. Prefer the normalized full name; add a short random suffix only
+// when that handle is already taken.
 function usernameBaseFromFullName(value) {
   const base = String(value ?? '')
     .normalize('NFD')
     .replace(/\p{M}/gu, '')
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '.')
-    .replace(/^[._-]+|[._-]+$/g, '')
-    .slice(0, 23)
-    .replace(/[._-]+$/g, '');
+    .replace(/[^a-z0-9]/g, '')
+    .slice(0, 15);
   return base || 'user';
 }
 
 async function generateUniqueUsername(conn, fullName) {
   const base = usernameBaseFromFullName(fullName);
   for (let attempt = 0; attempt < 20; attempt += 1) {
-    const suffix = crypto.randomBytes(3).toString('hex');
-    const candidate = `${base}-${suffix}`;
+    const suffix = attempt === 0 ? '' : String(crypto.randomInt(0, 10000)).padStart(4, '0');
+    const candidate = cleanText(`${base}${suffix}`, 30);
+    if (!/^[A-Za-z0-9_. -]{3,30}$/.test(candidate)) continue;
     if (usersByUsername.has(candidate)) continue;
     const [rows] = await conn.execute('SELECT id FROM users WHERE username = ? LIMIT 1', [candidate]);
     if (rows.length === 0) return candidate;
