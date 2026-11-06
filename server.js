@@ -4390,7 +4390,7 @@ const MAX_TICKETS_PER_ORDER = 10;
 
 async function sendTicketEmail({ to, eventTitle, venue, startsAt, quantity, ticketCode }) {
   const apiKey = process.env.BREVO_API_KEY;
-  if (!apiKey) return;
+  if (!apiKey || !process.env.MAIL_FROM_EMAIL) return;
 
   let timeout;
   try {
