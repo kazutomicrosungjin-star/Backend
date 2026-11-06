@@ -4388,6 +4388,72 @@ const EVENT_LIST_LIMIT = 50;
 const TICKET_LIST_LIMIT = 50;
 const MAX_TICKETS_PER_ORDER = 10;
 
+async function sendTicketEmail({ to, eventTitle, venue, startsAt, quantity, ticketCode }) {
+  const apiKey = process.env.BREVO_API_KEY;
+  if (!apiKey) return;
+
+  let timeout;
+  try {
+    const controller = new AbortController();
+    timeout = setTimeout(() => controller.abort(), 5000);
+    const safeTitle = cleanText(eventTitle, 150);
+    const safeVenue = cleanText(venue, 150);
+    const eventDate = new Date(startsAt).toLocaleString('en-PH', {
+      dateStyle: 'full',
+      timeStyle: 'short',
+      timeZone: 'Asia/Manila',
+    });
+    const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;',
+    })[char]);
+    const textContent = [
+      'Your PayCST ticket booking is confirmed.',
+      `Event: ${safeTitle}`,
+      `Date: ${eventDate}`,
+      `Venue: ${safeVenue}`,
+      `Quantity: ${quantity}`,
+      `Ticket code: ${ticketCode}`,
+    ].join('\n');
+    const htmlContent = [
+      '<p>Your PayCST ticket booking is confirmed.</p>',
+      `<p><strong>Event:</strong> ${escapeHtml(safeTitle)}<br>`,
+      `<strong>Date:</strong> ${escapeHtml(eventDate)}<br>`,
+      `<strong>Venue:</strong> ${escapeHtml(safeVenue)}<br>`,
+      `<strong>Quantity:</strong> ${quantity}<br>`,
+      `<strong>Ticket code:</strong> ${escapeHtml(ticketCode)}</p>`,
+    ].join('');
+
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        'api-key': apiKey,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        sender: {
+          email: process.env.MAIL_FROM_EMAIL,
+          name: process.env.MAIL_FROM_NAME,
+        },
+        to: [{ email: to }],
+        subject: `Your ticket for ${safeTitle}`,
+        textContent,
+        htmlContent,
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) console.error('ticket email failed');
+  } catch {
+    console.error('ticket email failed');
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 app.get('/api/events', requireAuth, asyncRoute(async (req, res) => {
   // Upcoming only, soonest first. starts_at is compared with MySQL's own clock,
   // never the client's, so a wrong device clock cannot buy a past event.
@@ -4434,7 +4500,7 @@ app.post('/api/events/:id/tickets', requireAuth, moneyLimiter, idempotent, requi
   try {
     await conn.beginTransaction();
 
-    const [[user]] = await conn.query('SELECT id, balance, verification_level FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    const [[user]] = await conn.query('SELECT id, email, balance, verification_level FROM users WHERE id = ? FOR UPDATE', [req.userId]);
     if (!user) {
       await conn.rollback();
       return res.status(401).json({ error: 'Not authenticated' });
@@ -4507,6 +4573,17 @@ app.post('/api/events/:id/tickets', requireAuth, moneyLimiter, idempotent, requi
       },
     };
     await commitWithIdempotency(conn, req, 200, body);
+
+    if (user.email && user.email.trim()) {
+      void sendTicketEmail({
+        to: user.email,
+        eventTitle: event.title,
+        venue: event.venue,
+        startsAt: event.starts_at,
+        quantity,
+        ticketCode,
+      }).catch(() => console.error('ticket email failed'));
+    }
 
     // Both rows are committed - refresh so the index doesn't serve a stale
     // balance (item #6 fix).
