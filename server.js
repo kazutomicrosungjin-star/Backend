@@ -1147,7 +1147,14 @@ function normalizePhone(value) {
 // UNIQUE. Prefer the normalized full name; add a short random suffix only
 // when that handle is already taken.
 function usernameBaseFromFullName(value) {
-  const base = String(value ?? '')
+  let name = String(value ?? '');
+  const comma = name.indexOf(',');
+  if (comma !== -1) {
+    const last = name.slice(0, comma).trim();
+    const first = name.slice(comma + 1).trim().split(/\s+/)[0] || '';
+    name = `${first}${last}`;
+  }
+  const base = name
     .normalize('NFD')
     .replace(/\p{M}/gu, '')
     .toLowerCase()
