@@ -150,6 +150,17 @@ CREATE TABLE IF NOT EXISTS transactions (
   KEY idx_tx_reversed (reversed_transfer_ref)
 ) ENGINE=InnoDB;
 
+CREATE TABLE IF NOT EXISTS reward_points_ledger (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  points INT NOT NULL,
+  source_type VARCHAR(20) NOT NULL,
+  source_id VARCHAR(64) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_source (source_type, source_id),
+  KEY idx_user (user_id, created_at)
+) ENGINE=InnoDB;
+
 -- ---------- double-charge protection ----------
 -- Also created at boot by server.js; keep both definitions identical.
 CREATE TABLE IF NOT EXISTS idempotency_keys (

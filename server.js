@@ -87,6 +87,12 @@ const crypto = require('crypto');
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const pool = require('./db');
+const { awardPoints } = require('./helpers/reward-points');
+const {
+  POINTS_PER_PESO_EARN,
+  POINTS_PER_PESO_REDEEM,
+  MIN_REDEEM_POINTS,
+} = require('./config/rewards');
 const semaphoreSms = require('./sms');
 const { sendSms: sendMoceanSms } = require('./sms-mocean');
 const SMS_PROVIDER = process.env.SMS_PROVIDER || 'semaphore';
@@ -3175,6 +3181,7 @@ app.post('/api/cashin/:id/simulate-paid', requireAuth, moneyLimiter, asyncRoute(
       ['user', req.userId, `Cash In via ${CASH_IN_CHANNELS[row.channel] || row.channel}`, 'Cash In', amt, 1, referenceDetails(row.reference)]
     );
     await conn.execute("UPDATE cash_ins SET status = 'completed', completed_at = NOW() WHERE id = ?", [row.id]);
+    await awardPoints(conn, req.userId, 'cashin', String(row.id), amt);
     await conn.commit();
     await refreshUserInIndex(req.userId);
     res.json({ ok: true, referenceNumber: row.reference });
@@ -3464,6 +3471,7 @@ app.post('/api/load', requireAuth, moneyLimiter, idempotent, requirePin, asyncRo
     );
 
     const body = { ok: true, referenceNumber: ref };
+    await awardPoints(conn, req.userId, 'load', ref, amt);
     await commitWithIdempotency(conn, req, 200, body);
 
     // Row is committed — refresh so the index doesn't serve a stale
@@ -3650,6 +3658,93 @@ app.get('/api/transactions/summary', requireAuth, asyncRoute(async (req, res) =>
     spendingOutCentavos: toCentavos(row.spendingOut),
     monthlyBudgetCentavos: budgetCentavos === null ? null : toCentavos(budgetCentavos),
   });
+}));
+
+app.get('/api/rewards', requireAuth, asyncRoute(async (req, res) => {
+  const [[balanceRow]] = await pool.query(
+    'SELECT COALESCE(SUM(points), 0) AS pointsBalance FROM reward_points_ledger WHERE user_id = ?',
+    [req.userId]
+  );
+  const [ledger] = await pool.query(
+    `SELECT points, source_type AS sourceType, source_id AS sourceId, created_at AS createdAt
+       FROM reward_points_ledger
+      WHERE user_id = ?
+      ORDER BY created_at DESC, id DESC
+      LIMIT 20`,
+    [req.userId]
+  );
+  const pointsBalance = Number(balanceRow.pointsBalance);
+  if (!Number.isSafeInteger(pointsBalance)) throw new Error('Invalid reward points balance');
+
+  res.json({
+    pointsBalance,
+    pesoValue: Math.floor(pointsBalance / POINTS_PER_PESO_REDEEM),
+    pointsPerPesoEarn: POINTS_PER_PESO_EARN,
+    pointsPerPesoRedeem: POINTS_PER_PESO_REDEEM,
+    minRedeemPoints: MIN_REDEEM_POINTS,
+    ledger: ledger.map((row) => ({ ...row, points: Number(row.points) })),
+  });
+}));
+
+app.post('/api/rewards/redeem', requireAuth, moneyLimiter, idempotent, requirePin, asyncRoute(async (req, res) => {
+  const requestedPoints = req.body?.points;
+  if (!Number.isInteger(requestedPoints) || requestedPoints < MIN_REDEEM_POINTS) {
+    return res.status(400).json({ error: `At least ${MIN_REDEEM_POINTS} points are required to redeem` });
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[user]] = await conn.query('SELECT id FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    if (!user) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const [[balanceRow]] = await conn.query(
+      'SELECT COALESCE(SUM(points), 0) AS pointsBalance FROM reward_points_ledger WHERE user_id = ?',
+      [req.userId]
+    );
+    const pointsBalance = Number(balanceRow.pointsBalance);
+    if (!Number.isSafeInteger(pointsBalance) || pointsBalance < 0) {
+      throw new Error('Invalid reward points balance');
+    }
+    if (requestedPoints > pointsBalance) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'You do not have enough reward points' });
+    }
+
+    const pesos = Math.floor(requestedPoints / POINTS_PER_PESO_REDEEM);
+    const pointsRedeemed = pesos * POINTS_PER_PESO_REDEEM;
+    const amountCentavos = pesos * 100;
+    const sourceId = req.idempotency?.key
+      ? crypto.createHash('sha256').update(`${req.userId}:${req.idempotency.key}`).digest('hex')
+      : crypto.randomBytes(16).toString('hex');
+    await conn.execute(
+      'INSERT INTO reward_points_ledger (user_id, points, source_type, source_id) VALUES (?,?,?,?)',
+      [req.userId, -pointsRedeemed, 'redeem', sourceId]
+    );
+    await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amountCentavos, req.userId]);
+    await conn.execute(
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
+      ['user', req.userId, 'Points redeemed', 'Reward', amountCentavos, 1]
+    );
+
+    const body = {
+      ok: true,
+      pointsRedeemed,
+      pesosCredited: pesos,
+      remainingPoints: pointsBalance - pointsRedeemed,
+    };
+    await commitWithIdempotency(conn, req, 200, body);
+    await refreshUserInIndex(req.userId);
+    res.json(body);
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 }));
 
 // ---------- monthly budget (advisory, never enforced) ----------
@@ -5980,6 +6075,7 @@ app.post('/api/admin/cashins/:id/respond', requireAdmin, asyncRoute(async (req, 
       ['user', row.user_id, `Cash In via ${CASH_IN_CHANNELS[row.channel] || row.channel}`, 'Cash In', amt, 1, referenceDetails(row.reference)]
     );
     await conn.execute("UPDATE cash_ins SET status = 'completed', completed_at = NOW() WHERE id = ?", [cashInId]);
+    await awardPoints(conn, row.user_id, 'cashin', String(cashInId), amt);
     await conn.commit();
 
     await refreshUserInIndex(row.user_id);
