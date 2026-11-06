@@ -4856,7 +4856,7 @@ app.get('/api/admin/users', requireAdmin, asyncRoute(async (req, res) => {
   // sort still runs, just on the bounded page instead of the whole table,
   // so it stays fast at any scale while keeping the mandatory sort step.
   const [rawUsers] = await pool.query(
-    `SELECT u.id, u.username, u.wallet_id AS walletId, u.balance, u.status, u.verification_level AS verificationLevel,
+    `SELECT u.id, u.username, u.full_name AS fullName, u.wallet_id AS walletId, u.balance, u.status, u.verification_level AS verificationLevel,
             (SELECT COUNT(*) FROM group_members gm WHERE gm.user_id = u.id) AS groupCount
      FROM users u
      ${whereClause}
